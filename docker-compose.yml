@@ -1,0 +1,35 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    command: redis-server --save "" --appendonly no
+
+  python-proxy:
+    build: .
+    ports: ["8000:8000"]
+    environment:
+      UPSTREAM_SIMPLE_URL: "https://pypi.org/simple"
+      REDIS_URL: "redis://redis:6379/0"
+      CACHE_TTL_SECONDS: "300"
+    depends_on: [redis]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; print(httpx.get('http://localhost:8000/health', timeout=2).text)"]
+      interval: 10s
+      retries: 5
+
+  nginx:
+    image: nginx:alpine
+    ports: ["8080:80"]
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on: [python-proxy]
+
+  # legacy upstream simulator (returns only HTML, no JSON/658) for testing synthesis
+  # run with: docker compose --profile legacy up
+  legacy-simple:
+    profiles: ["legacy"]
+    image: python:3.11-slim
+    command: python -m http.server 9000 --directory /data
+    volumes:
+      - ./tests/fixtures:/data:ro
+    ports: ["9000:9000"]
