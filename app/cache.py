@@ -4,6 +4,7 @@ import time
 
 try:
     import redis.asyncio as redis
+
     HAS_REDIS = True
 except ImportError:
     HAS_REDIS = False
@@ -18,7 +19,9 @@ class Cache:
         self.url = redis_url or settings.redis_url
         if HAS_REDIS:
             try:
-                self._redis = redis.from_url(self.url, decode_responses=True, socket_connect_timeout=1)
+                self._redis = redis.from_url(
+                    self.url, decode_responses=True, socket_connect_timeout=1
+                )
             except Exception:  # noqa: BLE001 - fallback to in-memory on any redis URL/connection error
                 self._redis = None
 
@@ -56,5 +59,6 @@ class Cache:
             except Exception:  # noqa: BLE001, S110 - fallback to in-memory cache
                 pass
         self._mem[key] = (time.time() + ttl, value)
+
 
 cache = Cache()

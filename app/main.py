@@ -16,6 +16,7 @@ from app.parse import model_to_html, model_to_json, parse_simple_html, parse_sim
 # shared httpx client
 http_client: httpx.AsyncClient | None = None
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
@@ -28,6 +29,7 @@ async def lifespan(app: FastAPI):
     if http_client:
         await http_client.aclose()
 
+
 app = FastAPI(title="python-proxy-cache", lifespan=lifespan)
 
 # simple in-memory metrics for perf harness
@@ -39,15 +41,18 @@ metrics = {
     "synthesis_count": 0,
 }
 
+
 def _want_json(accept: str | None) -> bool:
     if not accept:
         return False
     return "application/vnd.pypi.simple.v1+json" in accept
 
+
 @app.get("/health")
 async def health():
     redis_ok = await cache.ping()
     return {"status": "ok", "redis": redis_ok, "metrics": metrics}
+
 
 @app.get("/metrics")
 async def prom_metrics():
@@ -61,9 +66,15 @@ async def prom_metrics():
     ]
     return PlainTextResponse("\n".join(lines), media_type="text/plain")
 
+
 @app.get("/")
 async def root():
-    return {"service": "python-proxy-cache", "upstream": settings.upstream_simple_url, "endpoints": ["/simple/", "/simple/{project}/", "/health", "/metrics"]}
+    return {
+        "service": "python-proxy-cache",
+        "upstream": settings.upstream_simple_url,
+        "endpoints": ["/simple/", "/simple/{project}/", "/health", "/metrics"],
+    }
+
 
 @app.get("/simple/")
 async def simple_index(request: Request, accept: str | None = Header(default=None)):
@@ -95,12 +106,24 @@ async def simple_index(request: Request, accept: str | None = Header(default=Non
         # projects may be list of dicts with name
         names = [p["name"] if isinstance(p, dict) else p for p in projects]
         if want_json:
-            body = json.dumps({"projects": [{"name": n} for n in sorted(set(names))], "meta": {"api-version": "1.1"}})
+            body = json.dumps(
+                {
+                    "projects": [{"name": n} for n in sorted(set(names))],
+                    "meta": {"api-version": "1.1"},
+                }
+            )
             await cache.setex(cache_key, settings.cache_ttl_seconds, body)
-            return Response(body, media_type="application/vnd.pypi.simple.v1+json", headers={"X-Cache": "MISS", "X-Upstream-Time": f"{(time.perf_counter()-t0)*1000:.1f}ms"})
+            return Response(
+                body,
+                media_type="application/vnd.pypi.simple.v1+json",
+                headers={
+                    "X-Cache": "MISS",
+                    "X-Upstream-Time": f"{(time.perf_counter() - t0) * 1000:.1f}ms",
+                },
+            )
         else:
             # synthesize html
-            html = "<!DOCTYPE html><html><head><meta name=\"pypi:repository-version\" content=\"1.1\"></head><body>\n"
+            html = '<!DOCTYPE html><html><head><meta name="pypi:repository-version" content="1.1"></head><body>\n'
             for n in sorted(set(names)):
                 html += f'<a href="/simple/{n}/">{n}</a><br/>\n'
             html += "</body></html>"
@@ -111,15 +134,26 @@ async def simple_index(request: Request, accept: str | None = Header(default=Non
         if want_json:
             # parse html to extract names, synthesize json
             from bs4 import BeautifulSoup
+
             soup = BeautifulSoup(html, "html.parser")
             names = [a.text.strip() for a in soup.find_all("a") if a.text.strip()]
-            body = json.dumps({"projects": [{"name": n} for n in sorted(set(names))], "meta": {"api-version": "1.1"}})
+            body = json.dumps(
+                {
+                    "projects": [{"name": n} for n in sorted(set(names))],
+                    "meta": {"api-version": "1.1"},
+                }
+            )
             metrics["synthesis_count"] += 1
             await cache.setex(cache_key, settings.cache_ttl_seconds, body)
-            return Response(body, media_type="application/vnd.pypi.simple.v1+json", headers={"X-Cache": "MISS", "X-Synthesis": "1"})
+            return Response(
+                body,
+                media_type="application/vnd.pypi.simple.v1+json",
+                headers={"X-Cache": "MISS", "X-Synthesis": "1"},
+            )
         else:
             await cache.setex(cache_key, settings.cache_ttl_seconds, html)
             return Response(html, media_type="text/html", headers={"X-Cache": "MISS"})
+
 
 @app.get("/simple/{project}/")
 async def simple_project(project: str, request: Request, accept: str | None = Header(default=None)):
@@ -135,12 +169,16 @@ async def simple_project(project: str, request: Request, accept: str | None = He
     if cached := await cache.get(cache_key):
         metrics["cache_hits"] += 1
         ct = "application/vnd.pypi.simple.v1+json" if want_json else "text/html"
-        return Response(cached, media_type=ct, headers={
-            "X-Cache": "HIT",
-            "X-Cache-Key": canonical,
-            "X-Synthesis": "0",
-            "Server-Timing": f"cache;dur={(time.perf_counter()-start)*1000:.1f}",
-        })
+        return Response(
+            cached,
+            media_type=ct,
+            headers={
+                "X-Cache": "HIT",
+                "X-Cache-Key": canonical,
+                "X-Synthesis": "0",
+                "Server-Timing": f"cache;dur={(time.perf_counter() - start) * 1000:.1f}",
+            },
+        )
 
     # check if opposite format is cached -> synthesize without upstream
     if other_cached := await cache.get(other_key):
@@ -158,11 +196,15 @@ async def simple_project(project: str, request: Request, accept: str | None = He
                 ct = "text/html"
             await cache.setex(cache_key, settings.cache_ttl_seconds, body)
             metrics["cache_hits"] += 1  # synthesis hit
-            return Response(body, media_type=ct, headers={
-                "X-Cache": "HIT-synthesized",
-                "X-Synthesis": "1",
-                "Server-Timing": f"synthesis;dur={(time.perf_counter()-start)*1000:.1f}",
-            })
+            return Response(
+                body,
+                media_type=ct,
+                headers={
+                    "X-Cache": "HIT-synthesized",
+                    "X-Synthesis": "1",
+                    "Server-Timing": f"synthesis;dur={(time.perf_counter() - start) * 1000:.1f}",
+                },
+            )
         except (ValueError, TypeError, KeyError):
             pass
 
@@ -216,13 +258,17 @@ async def simple_project(project: str, request: Request, accept: str | None = He
             pass
         out_ct = "application/vnd.pypi.simple.v1+json" if want_json else "text/html"
         total_ms = (time.perf_counter() - start) * 1000
-        return Response(passthrough_body, media_type=out_ct, headers={
-            "X-Cache": "MISS",
-            "X-Upstream-Time": f"{upstream_time:.1f}ms",
-            "X-Synthesis": "0",  # no synthesis on the hot path
-            "X-Upstream-Content-Type": ct,
-            "Server-Timing": f"upstream;dur={upstream_time:.1f}, total;dur={total_ms:.1f}",
-        })
+        return Response(
+            passthrough_body,
+            media_type=out_ct,
+            headers={
+                "X-Cache": "MISS",
+                "X-Upstream-Time": f"{upstream_time:.1f}ms",
+                "X-Synthesis": "0",  # no synthesis on the hot path
+                "X-Upstream-Content-Type": ct,
+                "Server-Timing": f"upstream;dur={upstream_time:.1f}, total;dur={total_ms:.1f}",
+            },
+        )
 
     # --- Synthesis path: upstream format != client want -> need to convert ---
     if is_upstream_json:
@@ -249,10 +295,14 @@ async def simple_project(project: str, request: Request, accept: str | None = He
 
     metrics["synthesis_count"] += 1
     total_ms = (time.perf_counter() - start) * 1000
-    return Response(body, media_type=out_ct, headers={
-        "X-Cache": "MISS",
-        "X-Upstream-Time": f"{upstream_time:.1f}ms",
-        "X-Synthesis": "1",
-        "X-Upstream-Content-Type": ct,
-        "Server-Timing": f"upstream;dur={upstream_time:.1f}, total;dur={total_ms:.1f}",
-    })
+    return Response(
+        body,
+        media_type=out_ct,
+        headers={
+            "X-Cache": "MISS",
+            "X-Upstream-Time": f"{upstream_time:.1f}ms",
+            "X-Synthesis": "1",
+            "X-Upstream-Content-Type": ct,
+            "Server-Timing": f"upstream;dur={upstream_time:.1f}, total;dur={total_ms:.1f}",
+        },
+    )

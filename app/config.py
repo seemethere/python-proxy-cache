@@ -10,4 +10,5 @@ class Settings(BaseSettings):
     http_timeout: float = 10.0
     enable_background_metadata: bool = False  # HEAD .metadata for 658/714 (off by default, lazy)
 
+
 settings = Settings()

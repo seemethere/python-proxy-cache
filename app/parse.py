@@ -8,6 +8,7 @@ from app.models import File, Project
 
 _HASH_RE = re.compile(r"#([^#]+)$")
 
+
 def _parse_hashes(url: str) -> dict[str, str]:
     if "#" not in url:
         return {}
@@ -23,8 +24,10 @@ def _parse_hashes(url: str) -> dict[str, str]:
                 out[k] = v
     return out
 
+
 def _strip_fragment(url: str) -> str:
     return url.split("#", 1)[0]
+
 
 def parse_simple_html(project_name: str, html: str) -> Project:
     soup = BeautifulSoup(html, "html.parser")
@@ -44,6 +47,7 @@ def parse_simple_html(project_name: str, html: str) -> Project:
         # data-dist-info-metadata / data-core-metadata can be "true", "false", or hash-like
         dim = a.get("data-dist-info-metadata")
         cm = a.get("data-core-metadata")
+
         # normalize booleans
         def _norm_meta(v):
             if v is None:
@@ -62,16 +66,19 @@ def parse_simple_html(project_name: str, html: str) -> Project:
             else:
                 yanked_val = yanked
 
-        files.append(File(
-            filename=filename,
-            url=url,
-            hashes=hashes,
-            requires_python=requires_python,
-            yanked=yanked_val,
-            dist_info_metadata=_norm_meta(dim) if dim is not None else None,
-            core_metadata=_norm_meta(cm) if cm is not None else None,
-        ))
+        files.append(
+            File(
+                filename=filename,
+                url=url,
+                hashes=hashes,
+                requires_python=requires_python,
+                yanked=yanked_val,
+                dist_info_metadata=_norm_meta(dim) if dim is not None else None,
+                core_metadata=_norm_meta(cm) if cm is not None else None,
+            )
+        )
     return Project(name=project_name, files=files)
+
 
 def parse_simple_json(data: dict) -> Project:
     name = data.get("name", "")
@@ -80,18 +87,21 @@ def parse_simple_json(data: dict) -> Project:
         # PEP 691 fields: filename, url, hashes, requires-python, yanked, dist-info-metadata, core-metadata
         yanked = f.get("yanked")
         # yanked can be bool or string
-        files.append(File(
-            filename=f.get("filename", ""),
-            url=f.get("url", ""),
-            hashes=f.get("hashes", {}),
-            requires_python=f.get("requires-python"),
-            yanked=yanked,
-            dist_info_metadata=f.get("dist-info-metadata"),
-            core_metadata=f.get("core-metadata"),
-            size=f.get("size"),
-            upload_time=f.get("upload-time"),
-        ))
+        files.append(
+            File(
+                filename=f.get("filename", ""),
+                url=f.get("url", ""),
+                hashes=f.get("hashes", {}),
+                requires_python=f.get("requires-python"),
+                yanked=yanked,
+                dist_info_metadata=f.get("dist-info-metadata"),
+                core_metadata=f.get("core-metadata"),
+                size=f.get("size"),
+                upload_time=f.get("upload-time"),
+            )
+        )
     return Project(name=name, files=files)
+
 
 def model_to_json(project: Project) -> dict:
     files = []
@@ -124,10 +134,11 @@ def model_to_json(project: Project) -> dict:
         "meta": {"api-version": "1.1"},
     }
 
+
 def model_to_html(project: Project) -> str:
     lines = [
         "<!DOCTYPE html>",
-        "<html><head><meta name=\"pypi:repository-version\" content=\"1.1\">",
+        '<html><head><meta name="pypi:repository-version" content="1.1">',
         f"<title>Links for {project.name}</title></head><body>",
         f"<h1>Links for {project.name}</h1>",
     ]
@@ -164,6 +175,7 @@ def model_to_html(project: Project) -> str:
         lines.append(f'<a href="{_esc(url)}"{attr_str}>{_esc(f.filename)}</a><br/>')
     lines.append("</body></html>")
     return "\n".join(lines)
+
 
 def _esc(s: str) -> str:
     return s.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
