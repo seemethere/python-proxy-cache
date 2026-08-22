@@ -1220,7 +1220,7 @@ wheels = [
 [[package]]
 name = "python-proxy-cache"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "beautifulsoup4" },
     { name = "fastapi" },
@@ -1234,7 +1234,6 @@ dependencies = [
 
 [package.optional-dependencies]
 bench = [
-    { name = "httpx" },
     { name = "locust" },
     { name = "rich" },
 ]
@@ -1242,6 +1241,7 @@ dev = [
     { name = "httpx" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
+    { name = "rich" },
     { name = "ruff" },
 ]
 
@@ -1250,7 +1250,6 @@ requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.12" },
     { name = "fastapi", specifier = ">=0.110" },
     { name = "httpx", specifier = ">=0.27" },
-    { name = "httpx", marker = "extra == 'bench'", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },
     { name = "locust", marker = "extra == 'bench'", specifier = ">=2.20" },
     { name = "packaging", specifier = ">=24" },
@@ -1260,6 +1259,7 @@ requires-dist = [
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
     { name = "redis", extras = ["async"], specifier = ">=5" },
     { name = "rich", marker = "extra == 'bench'", specifier = ">=13" },
+    { name = "rich", marker = "extra == 'dev'", specifier = ">=13" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.29" },
 ]

@@ -1,23 +1,26 @@
 # Perf harness
 
-## Quick bench (no extra deps beyond httpx+rich)
+## Quick bench
 
 ```bash
-pip install -e ".[bench]"
+# install with bench extras
+pip install -e ".[bench]"   # or: uv sync --extra bench
+
 # 1. start stack
-docker compose up -d
+docker compose up -d   # or: uvicorn app.main:app --port 8000 --reload
 
 # 2. single-request comparison (shows synthesis overhead)
-python bench/bench.py --base http://localhost:8000 --compare --project requests
+pproxy-bench --base http://localhost:8000 --compare --project requests
+# also: python -m bench.bench --base http://localhost:8000 --compare
 # expect: cache HIT 1-5ms, MISS 30-80ms (upstream fetch + parse), upstream direct 20-60ms
 
 # 3. load test - measures degradation at scale
-python bench/bench.py --base http://localhost:8000 --concurrency 50 --requests 1000 --project requests
-python bench/bench.py --base http://localhost:8080 --concurrency 200 --requests 5000 --project urllib3  # via nginx
+pproxy-bench --base http://localhost:8000 --concurrency 50 --requests 1000 --project requests
+pproxy-bench --base http://localhost:8080 --concurrency 200 --requests 5000 --project urllib3  # via nginx
 
 # 4. compare nginx vs direct python (artifacts benefit from nginx)
-python bench/bench.py --base http://localhost:8000 --concurrency 100 --requests 1000 --accept "text/html"
-python bench/bench.py --base http://localhost:8080 --concurrency 100 --requests 1000 --accept "text/html"
+pproxy-bench --base http://localhost:8000 --concurrency 100 --requests 1000 --accept "text/html"
+pproxy-bench --base http://localhost:8080 --concurrency 100 --requests 1000 --accept "text/html"
 ```
 
 ## Locust (thousands of runners simulation)
