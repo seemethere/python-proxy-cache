@@ -86,6 +86,35 @@ async def test_health_ping_does_not_degrade_on_transient_failure():
 
 
 @pytest.mark.asyncio
+async def test_health_polls_do_not_inflate_request_error_counter():
+    """A polled /health during an outage must not look like request-path failures."""
+    c = Cache(backend="redis")
+    c._redis = None
+    c.state = CacheState.DEGRADED
+
+    async def always_fails():
+        c.redis_probe_errors += 1
+        c.state = CacheState.DEGRADED
+        return False
+
+    c.reconnect = always_fails  # ty: ignore[invalid-assignment]
+    for _ in range(5):
+        assert await c.health_ping() is False
+    assert c.redis_errors == 0
+    assert c.redis_probe_errors == 5
+
+
+@pytest.mark.asyncio
+async def test_request_path_failure_counts_as_redis_error():
+    c = Cache(backend="redis")
+    c._redis = FakeRedis(fail_get=True)  # ty: ignore[invalid-assignment]
+    c.state = CacheState.CONNECTED
+    assert await c.get("k") is None
+    assert c.redis_errors == 1
+    assert c.redis_probe_errors == 0
+
+
+@pytest.mark.asyncio
 async def test_ping_false_when_degraded_reconnect_fails():
     c = Cache(backend="redis")
     c._redis = None
@@ -130,4 +159,6 @@ async def test_health_includes_cache_fields(client):
     assert data["cache_backend"] == "memory"
     assert data["cache_state"] == "memory"
     assert data["redis"] is False
-    assert "proxy_cache_redis_errors_total" in (await client.get("/metrics")).text
+    body = (await client.get("/metrics")).text
+    assert "proxy_cache_redis_errors_total" in body
+    assert "proxy_cache_redis_probe_errors_total" in body

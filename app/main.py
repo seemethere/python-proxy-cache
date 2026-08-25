@@ -83,7 +83,7 @@ def _effective_project_ttl(headers: dict | httpx.Headers | None) -> int:
 async def health():
     redis_ok = await cache.health_ping()
     ready = True
-    if settings.cache_backend == "redis_required" and not redis_ok:
+    if cache.backend == "redis_required" and not redis_ok:
         ready = False
     status = "ok" if ready else "degraded"
     code = 200 if ready else 503
@@ -92,7 +92,7 @@ async def health():
             {
                 "status": status,
                 "redis": redis_ok,
-                "cache_backend": settings.cache_backend,
+                "cache_backend": cache.backend,
                 "cache_state": cache.state.value,
                 "metrics": metrics,
             }
@@ -118,6 +118,7 @@ async def prom_metrics():
         f"proxy_upstream_fetches {metrics['upstream_fetches']}",
         f"proxy_synthesis_count {metrics['synthesis_count']}",
         f"proxy_cache_redis_errors_total {cache.redis_errors}",
+        f"proxy_cache_redis_probe_errors_total {cache.redis_probe_errors}",
         f"proxy_cache_backend {backend_code}",
     ]
     return PlainTextResponse("\n".join(lines), media_type="text/plain")
