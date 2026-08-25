@@ -11,10 +11,9 @@ hooks = [
 ]
 
 [[repos]]
-repo = "https://github.com/astral-sh/ty-pre-commit"
-rev = "v0.0.10"
+repo = "local"
 hooks = [
-  { id = "ty" },
+  { id = "ty", name = "ty", entry = "uv run ty check", language = "system", types = ["python"], pass_filenames = false },
 ]
 
 [[repos]]
