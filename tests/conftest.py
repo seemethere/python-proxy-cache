@@ -23,7 +23,7 @@ class UpstreamRecorder:
     def call_count(self) -> int:
         return len(self.calls)
 
-    async def get(self, url, headers=None):
+    async def get(self, url, *args, headers=None, **kwargs):
         self.calls.append({"url": str(url), "headers": dict(headers or {})})
         result = self.handler(url, headers)
         if isinstance(result, Response):

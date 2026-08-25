@@ -330,7 +330,11 @@ async def simple_project(project: str, request: Request, accept: str | None = He
     if r.status_code == 404:
         # Distinct key so a cached 404 never returns as a 200 HIT on the success path.
         await cache.setex(not_found_key, settings.cache_404_ttl, "1")
-        raise HTTPException(status_code=404, detail=f"project {canonical} not found")
+        raise HTTPException(
+            status_code=404,
+            detail=f"project {canonical} not found",
+            headers={"X-Cache": "MISS", "X-Cache-Key": canonical},
+        )
     if r.status_code != 200:
         raise HTTPException(status_code=r.status_code, detail=r.text[:500])
     metrics["upstream_fetches"] += 1
