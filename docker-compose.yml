@@ -10,6 +10,7 @@ services:
     environment:
       UPSTREAM_SIMPLE_URL: "https://pypi.org/simple"
       REDIS_URL: "redis://redis:6379/0"
+      CACHE_BACKEND: "redis"
       CACHE_TTL_SECONDS: "300"
     depends_on: [redis]
     healthcheck:

@@ -26,6 +26,7 @@ async def lifespan(app: FastAPI):
         follow_redirects=True,
         headers={"User-Agent": "python-proxy-cache/0.1"},
     )
+    await cache.connect()
     yield
     if http_client:
         await http_client.aclose()
@@ -81,18 +82,38 @@ def _effective_project_ttl(headers: dict | httpx.Headers | None) -> int:
 @app.get("/health")
 async def health():
     redis_ok = await cache.ping()
-    return {"status": "ok", "redis": redis_ok, "metrics": metrics}
+    ready = True
+    if settings.cache_backend == "redis_required" and not redis_ok:
+        ready = False
+    status = "ok" if ready else "degraded"
+    code = 200 if ready else 503
+    return Response(
+        content=json.dumps(
+            {
+                "status": status,
+                "redis": redis_ok,
+                "cache_backend": settings.cache_backend,
+                "cache_state": cache.state.value,
+                "metrics": metrics,
+            }
+        ),
+        status_code=code,
+        media_type="application/json",
+    )
 
 
 @app.get("/metrics")
 async def prom_metrics():
     # minimal prometheus-style + json for bench
+    backend_code = {"memory": 0, "connected": 1, "degraded": 2}.get(cache.state.value, -1)
     lines = [
         f"proxy_requests_total {metrics['requests_total']}",
         f"proxy_cache_hits {metrics['cache_hits']}",
         f"proxy_cache_misses {metrics['cache_misses']}",
         f"proxy_upstream_fetches {metrics['upstream_fetches']}",
         f"proxy_synthesis_count {metrics['synthesis_count']}",
+        f"proxy_cache_redis_errors_total {cache.redis_errors}",
+        f"proxy_cache_backend {backend_code}",
     ]
     return PlainTextResponse("\n".join(lines), media_type="text/plain")
 

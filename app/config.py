@@ -1,10 +1,15 @@
+from typing import Literal
+
 from pydantic_settings import BaseSettings
+
+CacheBackend = Literal["memory", "redis", "redis_required"]
 
 
 class Settings(BaseSettings):
     upstream_simple_url: str = "https://pypi.org/simple"
     upstream_files_url: str = "https://files.pythonhosted.org"
     redis_url: str = "redis://redis:6379/0"
+    cache_backend: CacheBackend = "redis"
     cache_ttl_seconds: int = 300  # used for /simple/ index
     cache_project_ttl_seconds: int = (
         60  # shorter TTL for /simple/{project}/ — limits stale window after publish

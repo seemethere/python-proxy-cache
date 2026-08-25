@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import os
+
+# Force in-memory cache before app settings/cache singletons are constructed.
+os.environ.setdefault("CACHE_BACKEND", "memory")
+
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 
