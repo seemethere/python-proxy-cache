@@ -25,6 +25,13 @@ class Settings(BaseSettings):
     )
     http_timeout: float = 10.0
     enable_background_metadata: bool = False  # HEAD .metadata for 658/714 (off by default, lazy)
+    # Global caps for background metadata probing, not per-project: without them a
+    # burst of misses puts (projects x files) HEADs on upstream at once.
+    metadata_head_concurrency: int = 10
+    metadata_max_inflight_projects: int = 4
+    # Scheme used to reach extra allowlisted artifact hosts (the /artifacts/ path
+    # has lost the original scheme); the upstream_files_url host keeps its own.
+    artifact_host_scheme: Literal["https", "http"] = "https"
 
     def artifact_hosts(self) -> frozenset[str]:
         """Hosts eligible for /artifacts/ rewriting.

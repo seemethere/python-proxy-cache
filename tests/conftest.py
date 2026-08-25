@@ -19,21 +19,30 @@ from app.main import app
 
 @dataclass
 class UpstreamRecorder:
-    """Records upstream httpx.get calls and returns a canned Response."""
+    """Records upstream httpx.get/head calls and returns a canned Response."""
 
     handler: Callable[..., Response]
+    head_handler: Callable[..., Response] | None = None
     calls: list[dict] = field(default_factory=list)
 
     @property
     def call_count(self) -> int:
         return len(self.calls)
 
-    async def get(self, url, *args, headers=None, **kwargs):
-        self.calls.append({"url": str(url), "headers": dict(headers or {})})
+    async def get(self, url, *args, headers=None, **kwargs) -> Response:
+        self.calls.append({"method": "GET", "url": str(url), "headers": dict(headers or {})})
         result = self.handler(url, headers)
         if isinstance(result, Response):
             return result
-        return await result  # async handler
+        return await result
+
+    async def head(self, url, headers=None) -> Response:
+        self.calls.append({"method": "HEAD", "url": str(url), "headers": dict(headers or {})})
+        head_handler = self.head_handler or self.handler
+        result = head_handler(url, headers)
+        if isinstance(result, Response):
+            return result
+        return await result
 
 
 @pytest.fixture
@@ -55,10 +64,11 @@ def mock_upstream(monkeypatch: pytest.MonkeyPatch):
     orig_get = main_mod.http_client.get
     recorder_box: dict[str, UpstreamRecorder] = {}
 
-    def install(handler: Callable[..., Response]) -> UpstreamRecorder:
-        rec = UpstreamRecorder(handler=handler)
+    def install(handler: Callable[..., Response], head_handler=None) -> UpstreamRecorder:
+        rec = UpstreamRecorder(handler=handler, head_handler=head_handler)
         recorder_box["rec"] = rec
         monkeypatch.setattr(main_mod.http_client, "get", rec.get)
+        monkeypatch.setattr(main_mod.http_client, "head", rec.head)
         return rec
 
     yield install

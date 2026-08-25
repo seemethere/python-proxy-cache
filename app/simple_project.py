@@ -13,6 +13,7 @@ from app.artifacts import rewrite_project_urls, rewrite_simple_body
 from app.cache import cache
 from app.config import settings
 from app.deps import get_http_client
+from app.metadata import schedule_metadata_enrichment
 from app.metrics import metrics
 from app.parse import model_to_html, model_to_json, parse_simple_html, parse_simple_json
 from app.singleflight import miss_locks
@@ -272,6 +273,9 @@ async def simple_project(project: str, request: Request, accept: str | None = He
             except (ValueError, TypeError, KeyError):
                 pass
             out_ct = "application/vnd.pypi.simple.v1+json" if wants_json else "text/html"
+            schedule_metadata_enrichment(
+                canonical, passthrough_body, is_json=is_upstream_json, ttl=eff_ttl
+            )
             total_ms = (time.perf_counter() - start) * 1000
             return Response(
                 passthrough_body,
@@ -315,6 +319,7 @@ async def simple_project(project: str, request: Request, accept: str | None = He
             body, out_ct = json_body, "application/vnd.pypi.simple.v1+json"
 
         metrics["synthesis_count"] += 1
+        schedule_metadata_enrichment(canonical, body, is_json=(out_ct != "text/html"), ttl=eff_ttl)
         total_ms = (time.perf_counter() - start) * 1000
         return Response(
             body,
