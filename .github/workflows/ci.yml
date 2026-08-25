@@ -23,7 +23,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: uv sync --dev --group prek
+        run: uv sync --extra dev --group prek
 
       - name: Ruff check
         run: uv run ruff check
