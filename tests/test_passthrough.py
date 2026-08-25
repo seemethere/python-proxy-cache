@@ -35,7 +35,7 @@ async def test_passthrough_when_upstream_already_has_json():
             200, json=JSON_UPSTREAM, headers={"content-type": "application/vnd.pypi.simple.v1+json"}
         )
 
-    m.http_client.get = mock_get
+    m.http_client.get = mock_get  # ty: ignore[invalid-assignment]
     try:
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as ac:
@@ -52,7 +52,7 @@ async def test_passthrough_when_upstream_already_has_json():
             assert "requests-2.31.0" in r2.text
             assert "HIT" in r2.headers.get("x-cache", r2.headers.get("X-Cache", ""))
     finally:
-        m.http_client.get = orig_get
+        m.http_client.get = orig_get  # ty: ignore[invalid-assignment]
         cache._mem.clear()
 
 
@@ -70,7 +70,7 @@ async def test_passthrough_html_upstream_html_client():
     async def mock_get(url, headers=None):
         return Response(200, text=html, headers={"content-type": "text/html"})
 
-    m.http_client.get = mock_get
+    m.http_client.get = mock_get  # ty: ignore[invalid-assignment]
     try:
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as ac:
@@ -80,5 +80,5 @@ async def test_passthrough_html_upstream_html_client():
             assert r.headers.get("x-synthesis") == "0" or r.headers.get("X-Synthesis") == "0"
             assert "a.whl" in r.text
     finally:
-        m.http_client.get = orig_get
+        m.http_client.get = orig_get  # ty: ignore[invalid-assignment]
         cache._mem.clear()

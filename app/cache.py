@@ -22,7 +22,7 @@ class Cache:
                 self._redis = redis.from_url(
                     self.url, decode_responses=True, socket_connect_timeout=1
                 )
-            except Exception:  # noqa: BLE001 - fallback to in-memory on any redis URL/connection error
+            except Exception:  # fallback to in-memory on any redis URL/connection error
                 self._redis = None
 
     async def ping(self) -> bool:
@@ -31,7 +31,7 @@ class Cache:
         try:
             await self._redis.ping()
             return True
-        except Exception:  # noqa: BLE001 - any redis failure means not ok
+        except Exception:  # any redis failure means not ok
             return False
 
     async def get(self, key: str) -> str | None:
@@ -39,8 +39,10 @@ class Cache:
             try:
                 v = await self._redis.get(key)
                 if v is not None:
-                    return v
-            except Exception:  # noqa: BLE001, S110 - fallback to in-memory cache
+                    if isinstance(v, bytes):
+                        return v.decode()
+                    return str(v)
+            except Exception:  # fallback to in-memory cache
                 pass
         # fallback mem
         if key in self._mem:
@@ -56,7 +58,7 @@ class Cache:
             try:
                 await self._redis.setex(key, ttl, value)  # type: ignore[attr-defined]
                 return
-            except Exception:  # noqa: BLE001, S110 - fallback to in-memory cache
+            except Exception:  # fallback to in-memory cache
                 pass
         self._mem[key] = (time.time() + ttl, value)
 

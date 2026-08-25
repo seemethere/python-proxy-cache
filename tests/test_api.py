@@ -23,7 +23,7 @@ async def test_synthesis_html_upstream_serves_json():
     async def mock_get(url, headers=None):
         return Response(200, text=HTML_UPSTREAM, headers={"content-type": "text/html"})
 
-    m.http_client.get = mock_get
+    m.http_client.get = mock_get  # ty: ignore[invalid-assignment]
     try:
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as ac:
@@ -50,5 +50,5 @@ async def test_synthesis_html_upstream_serves_json():
             assert r3.status_code == 200
             assert "requests-2.31.0" in r3.text
     finally:
-        m.http_client.get = orig_get
+        m.http_client.get = orig_get  # ty: ignore[invalid-assignment]
         cache._mem.clear()

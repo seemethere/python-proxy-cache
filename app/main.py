@@ -95,7 +95,7 @@ async def simple_index(request: Request, accept: str | None = Header(default=Non
         r = await http_client.get(url, headers=headers)
         r.raise_for_status()
     except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"upstream error: {e}")
+        raise HTTPException(status_code=502, detail=f"upstream error: {e}") from e
     metrics["upstream_fetches"] += 1
     ct = r.headers.get("content-type", "")
     # upstream may return json or html
@@ -222,7 +222,7 @@ async def simple_project(project: str, request: Request, accept: str | None = He
     try:
         r = await http_client.get(upstream_url, headers=headers)
     except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"upstream error: {e}")
+        raise HTTPException(status_code=502, detail=f"upstream error: {e}") from e
     if r.status_code == 404:
         await cache.setex(cache_key, settings.cache_404_ttl, r.text)
         raise HTTPException(status_code=404, detail=f"project {canonical} not found")

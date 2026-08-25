@@ -36,6 +36,7 @@ def parse_simple_html(project_name: str, html: str) -> Project:
         href = a.get("href")
         if not href:
             continue
+        href = str(href) if not isinstance(href, str) else href
         filename = a.text.strip()
         # href may be relative or absolute
         hashes = _parse_hashes(href)
@@ -43,10 +44,26 @@ def parse_simple_html(project_name: str, html: str) -> Project:
 
         # attributes per PEP 503 / 658 / 714
         requires_python = a.get("data-requires-python")
+        if isinstance(requires_python, list):
+            requires_python = ", ".join(str(x) for x in requires_python)
+        elif requires_python is not None and not isinstance(requires_python, str):
+            requires_python = str(requires_python)
         yanked = a.get("data-yanked")
+        if isinstance(yanked, list):
+            yanked = ", ".join(str(x) for x in yanked)
+        elif yanked is not None and not isinstance(yanked, str):
+            yanked = str(yanked)
         # data-dist-info-metadata / data-core-metadata can be "true", "false", or hash-like
         dim = a.get("data-dist-info-metadata")
+        if isinstance(dim, list):
+            dim = ", ".join(str(x) for x in dim)
+        elif dim is not None and not isinstance(dim, str):
+            dim = str(dim)
         cm = a.get("data-core-metadata")
+        if isinstance(cm, list):
+            cm = ", ".join(str(x) for x in cm)
+        elif cm is not None and not isinstance(cm, str):
+            cm = str(cm)
 
         # normalize booleans
         def _norm_meta(v):
@@ -61,10 +78,7 @@ def parse_simple_html(project_name: str, html: str) -> Project:
         # data-yanked: "" or "true" or reason string. spec: absence = not yanked
         yanked_val = None
         if yanked is not None:
-            if yanked == "" or yanked.lower() == "true":
-                yanked_val = True
-            else:
-                yanked_val = yanked
+            yanked_val = True if yanked == "" or yanked.lower() == "true" else yanked
 
         files.append(
             File(
