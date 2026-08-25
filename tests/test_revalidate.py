@@ -91,11 +91,86 @@ async def test_revalidate_304_last_modified_only(client, mock_upstream):
     assert r2.headers.get("x-cache") == "REVALIDATED"
 
 
-async def test_304_without_stale_returns_502(client, mock_upstream):
-    mock_upstream(lambda url, headers=None: Response(304, headers={"etag": '"x"'}))
+async def test_orphan_etag_is_not_sent_and_does_not_502(client, mock_upstream):
+    """An etag that outlived its body (LRU eviction) must not strand the project.
+
+    Validators are small and bodies are large, so Redis under allkeys-lru evicts
+    the body first. Revalidating against a body we cannot serve used to 502 for
+    the remainder of the etag TTL.
+    """
+    seen: list[dict] = []
+
+    def handler(url, headers=None):
+        seen.append(dict(headers or {}))
+        return Response(200, text=HTML, headers={"content-type": "text/html"})
+
+    mock_upstream(handler)
     # Seed etag only — no stale body
     await cache.setex("simple:demo:etag", 600, '"x"')
     r = await client.get("/simple/demo/", headers={"Accept": "text/html"})
+    assert r.status_code == 200
+    assert "a.whl" in r.text
+    # the orphaned validator must not have been sent
+    assert "If-None-Match" not in seen[0]
+
+
+async def test_304_with_vanished_stale_refetches_unconditionally(client, mock_upstream):
+    """Stale body lost between the pre-flight check and the 304 -> refetch, not 502."""
+    state = {"n": 0}
+
+    def handler(url, headers=None):
+        state["n"] += 1
+        if state["n"] == 1:
+            # validator was sent because a stale body existed at request time
+            assert (headers or {}).get("If-None-Match") == '"x"'
+            return Response(304, headers={"etag": '"x"'})
+        # unconditional refetch after the stale body turned out to be gone
+        assert "If-None-Match" not in (headers or {})
+        return Response(200, text=HTML, headers={"content-type": "text/html"})
+
+    rec = mock_upstream(handler)
+    await cache.setex("simple:demo:etag", 600, '"x"')
+    await cache.setex("simple:demo:html:stale", 600, HTML)
+
+    # Drop the stale body after the have_stale pre-flight has already passed.
+    orig_get = cache.get
+
+    async def vanishing_get(key: str):
+        value = await orig_get(key)
+        if key == "simple:demo:html:stale":
+            cache._mem.pop(key, None)
+        return value
+
+    cache.get = vanishing_get  # ty: ignore[invalid-assignment]
+    try:
+        r = await client.get("/simple/demo/", headers={"Accept": "text/html"})
+    finally:
+        cache.get = orig_get  # ty: ignore[invalid-assignment]
+
+    assert r.status_code == 200
+    assert "a.whl" in r.text
+    assert rec.call_count == 2
+
+
+async def test_304_with_no_stale_anywhere_still_502s(client, mock_upstream):
+    """If upstream 304s even without validators there is genuinely nothing to serve."""
+    mock_upstream(lambda url, headers=None: Response(304, headers={"etag": '"x"'}))
+    await cache.setex("simple:demo:etag", 600, '"x"')
+    await cache.setex("simple:demo:html:stale", 600, HTML)
+
+    orig_get = cache.get
+
+    async def vanishing_get(key: str):
+        value = await orig_get(key)
+        if key == "simple:demo:html:stale":
+            cache._mem.pop(key, None)
+        return value
+
+    cache.get = vanishing_get  # ty: ignore[invalid-assignment]
+    try:
+        r = await client.get("/simple/demo/", headers={"Accept": "text/html"})
+    finally:
+        cache.get = orig_get  # ty: ignore[invalid-assignment]
     assert r.status_code == 502
 
 

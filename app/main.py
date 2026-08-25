@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from contextlib import asynccontextmanager
 
@@ -15,6 +16,8 @@ from app.config import settings
 from app.metrics import metrics, prometheus_text
 from app.parse import model_to_html, model_to_json, parse_simple_html, parse_simple_json
 from app.ttl import effective_project_ttl
+
+logger = logging.getLogger(__name__)
 
 # shared httpx client
 http_client: httpx.AsyncClient | None = None
@@ -236,12 +239,23 @@ async def simple_project(project: str, request: Request, accept: str | None = He
     # conditional GET: send etag/last-modified if we have them from stale window
     # Keys are per-canonical (not per-format) because upstream URL is same; representation
     # validation still benefits from 304 even if we synthesize opposite format.
+    #
+    # Only revalidate when a stale body actually survives to serve on a 304.
+    # Validators are tiny and the bodies are large, so a Redis running
+    # maxmemory-policy allkeys-lru evicts the bodies first — sending a validator we
+    # cannot satisfy would turn that into a hard 502 for the rest of its TTL.
     etag_key = f"simple:{canonical}:etag"
     lastmod_key = f"simple:{canonical}:lastmod"
-    if etag := await cache.get(etag_key):
-        headers["If-None-Match"] = etag
-    if last_mod := await cache.get(lastmod_key):
-        headers["If-Modified-Since"] = last_mod
+    etag = None
+    last_mod = None
+    have_stale = (await cache.get(f"{cache_key}:stale")) is not None or (
+        await cache.get(f"{other_key}:stale")
+    ) is not None
+    if have_stale:
+        if etag := await cache.get(etag_key):
+            headers["If-None-Match"] = etag
+        if last_mod := await cache.get(lastmod_key):
+            headers["If-Modified-Since"] = last_mod
 
     t0 = time.perf_counter()
     try:
@@ -268,32 +282,45 @@ async def simple_project(project: str, request: Request, accept: str | None = He
                 except (ValueError, TypeError, KeyError):
                     stale_body = None
         if stale_body is None:
-            raise HTTPException(status_code=502, detail="upstream 304 but no stale cache")
-        # effective TTL respects upstream Cache-Control if present on 304
-        eff_ttl = effective_project_ttl(r.headers)
-        await cache.setex(cache_key, eff_ttl, stale_body)
-        # refresh etag/lastmod TTL
-        if etag:
-            await cache.setex(etag_key, stale_ttl, etag)
-        if last_mod:
-            await cache.setex(lastmod_key, stale_ttl, last_mod)
-        # also refresh opposite stale's TTL if exists
-        other_stale = await cache.get(f"{other_key}:stale")
-        if other_stale:
-            await cache.setex(other_key, eff_ttl, other_stale)
-        metrics["cache_hits"] += 1
-        metrics["upstream_fetches"] += 1
-        ct = "application/vnd.pypi.simple.v1+json" if wants_json else "text/html"
-        return Response(
-            stale_body,
-            media_type=ct,
-            headers={
-                "X-Cache": "REVALIDATED",
-                "X-Cache-Key": canonical,
-                "X-Synthesis": "0",
-                "Server-Timing": f"revalidated;dur={(time.perf_counter() - start) * 1000:.1f}",
-            },
-        )
+            # Stale copy vanished between the have_stale check and now (TTL expiry or
+            # eviction). Drop the validators and refetch unconditionally rather than
+            # failing a request we can still satisfy.
+            logger.warning("304 for %s with no stale body; refetching unconditionally", canonical)
+            headers.pop("If-None-Match", None)
+            headers.pop("If-Modified-Since", None)
+            try:
+                r = await http_client.get(upstream_url, headers=headers)
+            except httpx.HTTPError as e:
+                raise HTTPException(status_code=502, detail=f"upstream error: {e}") from e
+            if r.status_code == 304:
+                # Upstream ignored the absent validators; nothing left to serve.
+                raise HTTPException(status_code=502, detail="upstream 304 but no stale cache")
+        else:
+            # effective TTL respects upstream Cache-Control if present on 304
+            eff_ttl = effective_project_ttl(r.headers)
+            await cache.setex(cache_key, eff_ttl, stale_body)
+            # refresh etag/lastmod TTL
+            if etag:
+                await cache.setex(etag_key, stale_ttl, etag)
+            if last_mod:
+                await cache.setex(lastmod_key, stale_ttl, last_mod)
+            # also refresh opposite stale's TTL if exists
+            other_stale = await cache.get(f"{other_key}:stale")
+            if other_stale:
+                await cache.setex(other_key, eff_ttl, other_stale)
+            metrics["cache_hits"] += 1
+            metrics["upstream_fetches"] += 1
+            ct = "application/vnd.pypi.simple.v1+json" if wants_json else "text/html"
+            return Response(
+                stale_body,
+                media_type=ct,
+                headers={
+                    "X-Cache": "REVALIDATED",
+                    "X-Cache-Key": canonical,
+                    "X-Synthesis": "0",
+                    "Server-Timing": f"revalidated;dur={(time.perf_counter() - start) * 1000:.1f}",
+                },
+            )
 
     if r.status_code == 404:
         # Distinct key so a cached 404 never returns as a 200 HIT on the success path.
