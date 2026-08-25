@@ -8,9 +8,14 @@ services:
     build: .
     ports: ["8000:8000"]
     environment:
-      UPSTREAM_SIMPLE_URL: "https://pypi.org/simple"
+      # overridable so the legacy profile below can repoint it without editing this file
+      UPSTREAM_SIMPLE_URL: "${UPSTREAM_SIMPLE_URL:-https://pypi.org/simple}"
+      UPSTREAM_FILES_URL: "${UPSTREAM_FILES_URL:-https://files.pythonhosted.org}"
+      ARTIFACT_HOST_ALLOWLIST: "${ARTIFACT_HOST_ALLOWLIST:-}"
       REDIS_URL: "redis://redis:6379/0"
+      CACHE_BACKEND: "redis"
       CACHE_TTL_SECONDS: "300"
+      ENABLE_BACKGROUND_METADATA: "${ENABLE_BACKGROUND_METADATA:-false}"
     depends_on: [redis]
     healthcheck:
       test: ["CMD", "python", "-c", "import httpx; print(httpx.get('http://localhost:8000/health', timeout=2).text)"]
@@ -24,11 +29,13 @@ services:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on: [python-proxy]
 
-  # legacy upstream simulator (returns only HTML, no JSON/658) for testing synthesis
-  # run with: docker compose --profile legacy up
+  # legacy upstream simulator (HTML-only Simple tree under tests/fixtures)
+  # run with:
+  #   UPSTREAM_SIMPLE_URL=http://legacy-simple:9000/simple docker compose --profile legacy up -d
   legacy-simple:
     profiles: ["legacy"]
     image: python:3.11-slim
+    working_dir: /data
     command: python -m http.server 9000 --directory /data
     volumes:
       - ./tests/fixtures:/data:ro

@@ -1,0 +1,61 @@
+import pytest
+
+from app.accept import CONTENT_TYPE_JSON, want_json
+from app.config import settings
+from app.ttl import MIN_UPSTREAM_TTL_SECONDS, effective_project_ttl, parse_max_age
+
+
+@pytest.mark.parametrize(
+    ("accept", "expected"),
+    [
+        (None, False),
+        ("", False),
+        ("text/html", False),
+        (CONTENT_TYPE_JSON, True),
+        (f"text/html, {CONTENT_TYPE_JSON}", True),
+        (f"{CONTENT_TYPE_JSON};q=0.9", True),
+        # q=0 means "not acceptable" — a substring match would get this wrong
+        (f"text/html, {CONTENT_TYPE_JSON};q=0", False),
+        (f"{CONTENT_TYPE_JSON};q=0.0", False),
+        ("application/vnd.pypi.simple.v1+json-not-really", False),
+        # media types are case-insensitive per RFC 9110
+        (CONTENT_TYPE_JSON.upper(), True),
+        # what pip actually sends
+        (f"{CONTENT_TYPE_JSON}, application/vnd.pypi.simple.v1+html;q=0.1, text/html;q=0.01", True),
+    ],
+)
+def test_want_json(accept, expected):
+    assert want_json(accept) is expected
+
+
+@pytest.mark.parametrize(
+    ("cc", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("public, max-age=600", 600),
+        ("max-age=60, must-revalidate", 60),
+        ("no-cache", None),
+        ("max-age=abc", None),
+    ],
+)
+def test_parse_max_age(cc, expected):
+    assert parse_max_age(cc) == expected
+
+
+def test_effective_project_ttl_caps_only():
+    base = settings.cache_project_ttl_seconds
+    assert effective_project_ttl(None) == base
+    assert effective_project_ttl({}) == base
+    # shorter max-age wins
+    assert effective_project_ttl({"cache-control": "max-age=5"}) == 5
+    # longer max-age does not extend
+    assert effective_project_ttl({"Cache-Control": f"max-age={base + 100}"}) == base
+
+
+def test_effective_project_ttl_floors_tiny_max_age():
+    """max-age=0 must not disable caching outright."""
+    assert effective_project_ttl({"cache-control": "max-age=0"}) == MIN_UPSTREAM_TTL_SECONDS
+    assert effective_project_ttl({"cache-control": "max-age=3"}) == MIN_UPSTREAM_TTL_SECONDS
+    # above the floor, upstream still wins
+    assert effective_project_ttl({"cache-control": "max-age=30"}) == 30
