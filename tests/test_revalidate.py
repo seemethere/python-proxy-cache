@@ -1,0 +1,139 @@
+from __future__ import annotations
+
+from httpx import Response
+
+from app.cache import cache
+from app.config import settings
+
+HTML = (
+    "<!DOCTYPE html><html><body>"
+    '<a href="https://files.pythonhosted.org/packages/a.whl#sha256=abc">a.whl</a>'
+    "</body></html>"
+)
+
+
+async def test_200_stores_etag_for_conditional_get(client, mock_upstream):
+    rec = mock_upstream(
+        lambda url, headers=None: Response(
+            200,
+            text=HTML,
+            headers={
+                "content-type": "text/html",
+                "etag": '"v1"',
+                "last-modified": "Mon, 01 Jan 2024 00:00:00 GMT",
+            },
+        )
+    )
+    r = await client.get("/simple/demo/", headers={"Accept": "text/html"})
+    assert r.status_code == 200
+    assert rec.call_count == 1
+    assert await cache.get("simple:demo:etag") == '"v1"'
+    assert await cache.get("simple:demo:lastmod") == "Mon, 01 Jan 2024 00:00:00 GMT"
+
+
+async def test_revalidate_304_with_etag(client, mock_upstream):
+    state = {"n": 0}
+
+    def handler(url, headers=None):
+        state["n"] += 1
+        headers = headers or {}
+        if state["n"] == 1:
+            return Response(
+                200,
+                text=HTML,
+                headers={"content-type": "text/html", "etag": '"v1"'},
+            )
+        # second call should be conditional
+        assert headers.get("If-None-Match") == '"v1"'
+        return Response(304, headers={"etag": '"v1"'})
+
+    rec = mock_upstream(handler)
+    r1 = await client.get("/simple/demo/", headers={"Accept": "text/html"})
+    assert r1.status_code == 200
+    assert r1.headers.get("x-cache") == "MISS"
+
+    # Expire primary key; keep stale + etag. Also drop opposite warm cache so we
+    # exercise the upstream 304 path instead of HIT-synthesized.
+    cache._mem.pop("simple:demo:html", None)
+    cache._mem.pop("simple:demo:json", None)
+    assert await cache.get("simple:demo:html:stale") is not None
+
+    r2 = await client.get("/simple/demo/", headers={"Accept": "text/html"})
+    assert r2.status_code == 200
+    assert r2.headers.get("x-cache") == "REVALIDATED"
+    assert "a.whl" in r2.text
+    assert rec.call_count == 2
+
+
+async def test_revalidate_304_last_modified_only(client, mock_upstream):
+    state = {"n": 0}
+    lastmod = "Tue, 02 Jan 2024 12:00:00 GMT"
+
+    def handler(url, headers=None):
+        state["n"] += 1
+        headers = headers or {}
+        if state["n"] == 1:
+            return Response(
+                200,
+                text=HTML,
+                headers={"content-type": "text/html", "last-modified": lastmod},
+            )
+        assert headers.get("If-Modified-Since") == lastmod
+        assert "If-None-Match" not in headers
+        return Response(304, headers={"last-modified": lastmod})
+
+    mock_upstream(handler)
+    await client.get("/simple/demo/", headers={"Accept": "text/html"})
+    cache._mem.pop("simple:demo:html", None)
+    cache._mem.pop("simple:demo:json", None)
+    r2 = await client.get("/simple/demo/", headers={"Accept": "text/html"})
+    assert r2.status_code == 200
+    assert r2.headers.get("x-cache") == "REVALIDATED"
+
+
+async def test_304_without_stale_returns_502(client, mock_upstream):
+    mock_upstream(lambda url, headers=None: Response(304, headers={"etag": '"x"'}))
+    # Seed etag only — no stale body
+    await cache.setex("simple:demo:etag", 600, '"x"')
+    r = await client.get("/simple/demo/", headers={"Accept": "text/html"})
+    assert r.status_code == 502
+
+
+async def test_304_synthesizes_from_opposite_stale(client, mock_upstream):
+    await cache.setex("simple:demo:html:stale", 600, HTML)
+    await cache.setex("simple:demo:etag", 600, '"v1"')
+
+    def handler(url, headers=None):
+        assert (headers or {}).get("If-None-Match") == '"v1"'
+        return Response(304, headers={"etag": '"v1"'})
+
+    mock_upstream(handler)
+    r = await client.get("/simple/demo/", headers={"Accept": "application/vnd.pypi.simple.v1+json"})
+    assert r.status_code == 200
+    assert r.headers.get("x-cache") == "REVALIDATED"
+    data = r.json()
+    assert data["name"] == "demo"
+    assert data["files"][0]["hashes"]["sha256"] == "abc"
+
+
+async def test_cache_control_shortens_setex_ttl(client, mock_upstream, monkeypatch):
+    recorded: list[tuple[str, int]] = []
+    orig = cache.setex
+
+    async def spy(key: str, ttl: int, value: str):
+        recorded.append((key, ttl))
+        return await orig(key, ttl, value)
+
+    monkeypatch.setattr(cache, "setex", spy)
+    mock_upstream(
+        lambda url, headers=None: Response(
+            200,
+            text=HTML,
+            headers={"content-type": "text/html", "cache-control": "max-age=5"},
+        )
+    )
+    await client.get("/simple/demo/", headers={"Accept": "text/html"})
+    primary = [ttl for key, ttl in recorded if key == "simple:demo:html"]
+    assert primary
+    assert primary[0] == 5
+    assert primary[0] < settings.cache_project_ttl_seconds
