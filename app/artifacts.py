@@ -10,8 +10,34 @@ from app.models import File, Project
 _ATTR_RE = re.compile(r"(?P<attr>href)\s*=\s*(?P<quote>[\"'])(?P<url>[^\"']*)(?P=quote)")
 
 
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def authority_of(parsed) -> str:
+    """host[:port] for a parsed URL, omitting the port when it is the default.
+
+    urlparse().hostname drops the port entirely, which would rewrite an internal
+    index on nexus.internal:8081 to /artifacts/nexus.internal/ — unreachable.
+    """
+    host = (parsed.hostname or "").lower()
+    port = parsed.port
+    if port is not None and port != _DEFAULT_PORTS.get(parsed.scheme):
+        return f"{host}:{port}"
+    return host
+
+
 def host_allowed(host: str) -> bool:
-    return host.lower() in settings.artifact_hosts()
+    """Allow an exact host[:port] entry, or a bare host on its default port.
+
+    Deliberately strict about ports: matching a bare allowlist entry against any
+    port would let an upstream link aim the proxy at arbitrary ports on a host
+    that was only meant to be reachable on its normal one.
+    """
+    authority = host.lower()
+    hosts = settings.artifact_hosts()
+    if authority in hosts:
+        return True
+    return ":" not in authority and authority in hosts
 
 
 def rewrite_file_url(url: str, *, base: str | None = None) -> str:
@@ -29,7 +55,7 @@ def rewrite_file_url(url: str, *, base: str | None = None) -> str:
     parsed = urlparse(resolved)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         return url
-    host = parsed.hostname.lower()
+    host = authority_of(parsed)
     if not host_allowed(host):
         return url
     # Drop userinfo; keep path/query/fragment

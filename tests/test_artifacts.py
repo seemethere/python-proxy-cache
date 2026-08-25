@@ -156,3 +156,30 @@ async def test_passthrough_json_keeps_pep700_708_740_fields(client, mock_upstrea
     assert data["files"][0]["provenance"] == "https://files.pythonhosted.org/a.whl.provenance"
     assert data["files"][0]["core-metadata"] == {"sha256": "deadbeef"}
     assert data["files"][0]["url"].startswith("/artifacts/files.pythonhosted.org/")
+
+
+def test_rewrite_preserves_non_default_port(monkeypatch):
+    """urlparse().hostname drops the port; an internal index on :8081 must survive."""
+    monkeypatch.setattr(settings, "artifact_host_allowlist", "nexus.internal:8081")
+    out = rewrite_file_url("http://nexus.internal:8081/repo/a.whl#sha256=abc")
+    assert out == "/artifacts/nexus.internal:8081/repo/a.whl#sha256=abc"
+
+
+def test_default_port_is_omitted(monkeypatch):
+    monkeypatch.setattr(settings, "artifact_host_allowlist", "")
+    assert rewrite_file_url("https://files.pythonhosted.org:443/p/a.whl") == (
+        "/artifacts/files.pythonhosted.org/p/a.whl"
+    )
+
+
+def test_allowlist_is_port_strict(monkeypatch):
+    """A bare host entry must not authorise arbitrary ports on that host."""
+    monkeypatch.setattr(settings, "artifact_host_allowlist", "nexus.internal")
+    assert host_allowed("nexus.internal")
+    assert not host_allowed("nexus.internal:1337")
+    # an explicit host:port entry authorises only that port
+    monkeypatch.setattr(settings, "artifact_host_allowlist", "nexus.internal:8081")
+    assert host_allowed("nexus.internal:8081")
+    assert not host_allowed("nexus.internal:9999")
+    url = "http://nexus.internal:1337/x.whl"
+    assert rewrite_file_url(url) == url  # left alone, not rewritten

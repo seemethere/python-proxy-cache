@@ -38,9 +38,15 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=8)
 def _artifact_hosts(upstream_files_url: str, allowlist: str) -> frozenset[str]:
     hosts: set[str] = set()
-    files_host = urlparse(upstream_files_url).hostname
-    if files_host:
-        hosts.add(files_host.lower())
+    parsed = urlparse(upstream_files_url)
+    if parsed.hostname:
+        # include the port when non-default so an internal files host on a custom
+        # port is allowlisted as the same authority the rewrite emits
+        default = {"http": 80, "https": 443}.get(parsed.scheme)
+        if parsed.port is not None and parsed.port != default:
+            hosts.add(f"{parsed.hostname.lower()}:{parsed.port}")
+        else:
+            hosts.add(parsed.hostname.lower())
     for part in allowlist.split(","):
         h = part.strip().lower()
         if h:
