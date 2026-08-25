@@ -198,6 +198,18 @@ async def simple_project(project: str, request: Request, accept: str | None = He
     project_ttl = settings.cache_project_ttl_seconds
     stale_ttl = settings.cache_stale_ttl_seconds
 
+    not_found_key = f"simple:{canonical}:404"
+    if await cache.get(not_found_key) is not None:
+        metrics["cache_hits"] += 1
+        raise HTTPException(
+            status_code=404,
+            detail=f"project {canonical} not found",
+            headers={
+                "X-Cache": "HIT",
+                "X-Cache-Key": canonical,
+            },
+        )
+
     if cached := await cache.get(cache_key):
         metrics["cache_hits"] += 1
         ct = "application/vnd.pypi.simple.v1+json" if want_json else "text/html"
@@ -316,7 +328,8 @@ async def simple_project(project: str, request: Request, accept: str | None = He
         )
 
     if r.status_code == 404:
-        await cache.setex(cache_key, settings.cache_404_ttl, r.text)
+        # Distinct key so a cached 404 never returns as a 200 HIT on the success path.
+        await cache.setex(not_found_key, settings.cache_404_ttl, "1")
         raise HTTPException(status_code=404, detail=f"project {canonical} not found")
     if r.status_code != 200:
         raise HTTPException(status_code=r.status_code, detail=r.text[:500])
