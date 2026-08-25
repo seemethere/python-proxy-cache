@@ -2,7 +2,7 @@ import pytest
 
 from app.accept import CONTENT_TYPE_JSON, want_json
 from app.config import settings
-from app.ttl import effective_project_ttl, parse_max_age
+from app.ttl import MIN_UPSTREAM_TTL_SECONDS, effective_project_ttl, parse_max_age
 
 
 @pytest.mark.parametrize(
@@ -47,3 +47,11 @@ def test_effective_project_ttl_caps_only():
     assert effective_project_ttl({"cache-control": "max-age=5"}) == 5
     # longer max-age does not extend
     assert effective_project_ttl({"Cache-Control": f"max-age={base + 100}"}) == base
+
+
+def test_effective_project_ttl_floors_tiny_max_age():
+    """max-age=0 must not disable caching outright."""
+    assert effective_project_ttl({"cache-control": "max-age=0"}) == MIN_UPSTREAM_TTL_SECONDS
+    assert effective_project_ttl({"cache-control": "max-age=3"}) == MIN_UPSTREAM_TTL_SECONDS
+    # above the floor, upstream still wins
+    assert effective_project_ttl({"cache-control": "max-age=30"}) == 30
