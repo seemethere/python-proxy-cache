@@ -14,6 +14,10 @@ from app.ttl import effective_project_ttl, parse_max_age
         (CONTENT_TYPE_JSON, True),
         (f"text/html, {CONTENT_TYPE_JSON}", True),
         (f"{CONTENT_TYPE_JSON};q=0.9", True),
+        # q=0 means "not acceptable" — a substring match would get this wrong
+        (f"text/html, {CONTENT_TYPE_JSON};q=0", False),
+        (f"{CONTENT_TYPE_JSON};q=0.0", False),
+        ("application/vnd.pypi.simple.v1+json-not-really", False),
     ],
 )
 def test_want_json(accept, expected):

@@ -6,8 +6,6 @@ from bs4 import BeautifulSoup
 
 from app.models import File, Project
 
-_HASH_RE = re.compile(r"#([^#]+)$")
-
 
 def _parse_hashes(url: str) -> dict[str, str]:
     if "#" not in url:
