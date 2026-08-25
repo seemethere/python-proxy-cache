@@ -27,17 +27,14 @@ def authority_of(parsed) -> str:
 
 
 def host_allowed(host: str) -> bool:
-    """Allow an exact host[:port] entry, or a bare host on its default port.
+    """Exact authority match against the allowlist.
 
-    Deliberately strict about ports: matching a bare allowlist entry against any
-    port would let an upstream link aim the proxy at arbitrary ports on a host
-    that was only meant to be reachable on its normal one.
+    Deliberately strict about ports. Both sides are normalised by authority_of,
+    so a bare allowlist entry carries the scheme's default port implicitly and
+    matches only that; an upstream link cannot aim the proxy at some other port
+    on a host that was only meant to be reachable on its normal one.
     """
-    authority = host.lower()
-    hosts = settings.artifact_hosts()
-    if authority in hosts:
-        return True
-    return ":" not in authority and authority in hosts
+    return host.lower() in settings.artifact_hosts()
 
 
 def rewrite_file_url(url: str, *, base: str | None = None) -> str:
