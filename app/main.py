@@ -15,6 +15,7 @@ from app.cache import cache
 from app.config import settings
 from app.metrics import metrics, prometheus_text
 from app.parse import model_to_html, model_to_json, parse_simple_html, parse_simple_json
+from app.singleflight import miss_locks
 from app.ttl import effective_project_ttl
 
 logger = logging.getLogger(__name__)
@@ -156,6 +157,73 @@ async def simple_index(request: Request, accept: str | None = Header(default=Non
             return Response(html, media_type="text/html", headers={"X-Cache": "MISS"})
 
 
+def _cached_response(body: str, *, wants_json: bool, canonical: str, start: float) -> Response:
+    ct = "application/vnd.pypi.simple.v1+json" if wants_json else "text/html"
+    return Response(
+        body,
+        media_type=ct,
+        headers={
+            "X-Cache": "HIT",
+            "X-Cache-Key": canonical,
+            "X-Synthesis": "0",
+            "Server-Timing": f"cache;dur={(time.perf_counter() - start) * 1000:.1f}",
+        },
+    )
+
+
+async def _try_serve_from_cache(
+    *, canonical: str, cache_key: str, other_key: str, wants_json: bool, start: float
+) -> Response | None:
+    """Serve from the negative cache, the primary key, or the opposite format.
+
+    Returns None when only an upstream fetch can satisfy the request. Called once
+    before taking the miss lock and again after acquiring it, so waiters released
+    by the leader pick up the freshly filled entry instead of refetching.
+    Raises HTTPException(404) on a negative-cache hit.
+    """
+    if await cache.get(f"simple:{canonical}:404") is not None:
+        metrics["cache_hits"] += 1
+        raise HTTPException(
+            status_code=404,
+            detail=f"project {canonical} not found",
+            headers={"X-Cache": "HIT", "X-Cache-Key": canonical},
+        )
+
+    if cached := await cache.get(cache_key):
+        metrics["cache_hits"] += 1
+        return _cached_response(cached, wants_json=wants_json, canonical=canonical, start=start)
+
+    # opposite format is cached -> synthesize without going upstream
+    if other_cached := await cache.get(other_key):
+        try:
+            if wants_json:
+                proj = parse_simple_html(canonical, other_cached)
+                body = json.dumps(model_to_json(proj))
+                ct = "application/vnd.pypi.simple.v1+json"
+            else:
+                proj = parse_simple_json(json.loads(other_cached))
+                body = model_to_html(proj)
+                ct = "text/html"
+        except (ValueError, TypeError, KeyError):
+            # unparseable cache entry — fall through to an upstream fetch
+            return None
+        await cache.setex(cache_key, settings.cache_project_ttl_seconds, body)
+        # keep stale copy for revalidation window
+        await cache.setex(f"{cache_key}:stale", settings.cache_stale_ttl_seconds, body)
+        metrics["synthesis_count"] += 1
+        metrics["cache_hits"] += 1
+        return Response(
+            body,
+            media_type=ct,
+            headers={
+                "X-Cache": "HIT-synthesized",
+                "X-Synthesis": "1",
+                "Server-Timing": f"synthesis;dur={(time.perf_counter() - start) * 1000:.1f}",
+            },
+        )
+    return None
+
+
 @app.get("/simple/{project}/")
 async def simple_project(project: str, request: Request, accept: str | None = Header(default=None)):
     start = time.perf_counter()
@@ -166,262 +234,225 @@ async def simple_project(project: str, request: Request, accept: str | None = He
     cache_key = f"simple:{canonical}:{'json' if wants_json else 'html'}"
     # opposite format key for synthesis without refetch
     other_key = f"simple:{canonical}:{'html' if wants_json else 'json'}"
-    project_ttl = settings.cache_project_ttl_seconds
     stale_ttl = settings.cache_stale_ttl_seconds
 
     not_found_key = f"simple:{canonical}:404"
-    if await cache.get(not_found_key) is not None:
-        metrics["cache_hits"] += 1
-        raise HTTPException(
-            status_code=404,
-            detail=f"project {canonical} not found",
-            headers={
-                "X-Cache": "HIT",
-                "X-Cache-Key": canonical,
-            },
-        )
+    serve_args = {
+        "canonical": canonical,
+        "cache_key": cache_key,
+        "other_key": other_key,
+        "wants_json": wants_json,
+        "start": start,
+    }
+    if (hit := await _try_serve_from_cache(**serve_args)) is not None:
+        return hit
 
-    if cached := await cache.get(cache_key):
-        metrics["cache_hits"] += 1
-        ct = "application/vnd.pypi.simple.v1+json" if wants_json else "text/html"
-        return Response(
-            cached,
-            media_type=ct,
-            headers={
-                "X-Cache": "HIT",
-                "X-Cache-Key": canonical,
-                "X-Synthesis": "0",
-                "Server-Timing": f"cache;dur={(time.perf_counter() - start) * 1000:.1f}",
-            },
-        )
+    # Singleflight: one upstream fill per project. Waiters re-check the cache after
+    # acquiring the lock, so a stampede collapses to a single upstream fetch.
+    # Multi-replica coherence still relies on Redis + nginx proxy_cache_lock.
+    async with miss_locks.hold(f"simple:{canonical}:fill"):
+        if (hit := await _try_serve_from_cache(**serve_args)) is not None:
+            return hit
 
-    # check if opposite format is cached -> synthesize without upstream
-    if other_cached := await cache.get(other_key):
-        metrics["synthesis_count"] += 1
-        # parse other and convert
-        try:
-            if wants_json:
-                # other is html -> json
-                proj = parse_simple_html(canonical, other_cached)
-                body = json.dumps(model_to_json(proj))
-                ct = "application/vnd.pypi.simple.v1+json"
-            else:
-                proj = parse_simple_json(json.loads(other_cached))
-                body = model_to_html(proj)
-                ct = "text/html"
-            await cache.setex(cache_key, project_ttl, body)
-            # keep stale copy for revalidation window
-            await cache.setex(f"{cache_key}:stale", stale_ttl, body)
-            metrics["cache_hits"] += 1  # synthesis hit
-            return Response(
-                body,
-                media_type=ct,
-                headers={
-                    "X-Cache": "HIT-synthesized",
-                    "X-Synthesis": "1",
-                    "Server-Timing": f"synthesis;dur={(time.perf_counter() - start) * 1000:.1f}",
-                },
-            )
-        except (ValueError, TypeError, KeyError):
-            pass
-
-    metrics["cache_misses"] += 1
-    # fetch upstream — forward client's preference but accept either
-    assert http_client is not None
-    upstream_url = f"{settings.upstream_simple_url.rstrip('/')}/{canonical}/"
-    client_accept = request.headers.get("accept", "")
-    # If client explicitly wants JSON, ask upstream for JSON first; otherwise prefer what upstream has
-    if client_accept:
-        headers = {"Accept": client_accept}
-    else:
-        headers = {"Accept": "application/vnd.pypi.simple.v1+json, text/html;q=0.9"}
-
-    # conditional GET: send etag/last-modified if we have them from stale window
-    # Keys are per-canonical (not per-format) because upstream URL is same; representation
-    # validation still benefits from 304 even if we synthesize opposite format.
-    #
-    # Only revalidate when a stale body actually survives to serve on a 304.
-    # Validators are tiny and the bodies are large, so a Redis running
-    # maxmemory-policy allkeys-lru evicts the bodies first — sending a validator we
-    # cannot satisfy would turn that into a hard 502 for the rest of its TTL.
-    etag_key = f"simple:{canonical}:etag"
-    lastmod_key = f"simple:{canonical}:lastmod"
-    etag = None
-    last_mod = None
-    have_stale = (await cache.get(f"{cache_key}:stale")) is not None or (
-        await cache.get(f"{other_key}:stale")
-    ) is not None
-    if have_stale:
-        if etag := await cache.get(etag_key):
-            headers["If-None-Match"] = etag
-        if last_mod := await cache.get(lastmod_key):
-            headers["If-Modified-Since"] = last_mod
-
-    t0 = time.perf_counter()
-    try:
-        r = await http_client.get(upstream_url, headers=headers)
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"upstream error: {e}") from e
-
-    # 304 Not Modified — revalidate stale body
-    if r.status_code == 304:
-        stale_body = await cache.get(f"{cache_key}:stale")
-        if stale_body is None:
-            # fallback: try opposite stale then synthesize, or the other stale directly
-            other_stale = await cache.get(f"{other_key}:stale")
-            if other_stale is not None:
-                try:
-                    if wants_json:
-                        proj = parse_simple_html(canonical, other_stale)
-                        stale_body = json.dumps(model_to_json(proj))
-                    else:
-                        proj = parse_simple_json(json.loads(other_stale))
-                        stale_body = model_to_html(proj)
-                    # cache synthesized stale as well
-                    await cache.setex(f"{other_key}:stale", stale_ttl, other_stale)
-                except (ValueError, TypeError, KeyError):
-                    stale_body = None
-        if stale_body is None:
-            # Stale copy vanished between the have_stale check and now (TTL expiry or
-            # eviction). Drop the validators and refetch unconditionally rather than
-            # failing a request we can still satisfy.
-            logger.warning("304 for %s with no stale body; refetching unconditionally", canonical)
-            headers.pop("If-None-Match", None)
-            headers.pop("If-Modified-Since", None)
-            try:
-                r = await http_client.get(upstream_url, headers=headers)
-            except httpx.HTTPError as e:
-                raise HTTPException(status_code=502, detail=f"upstream error: {e}") from e
-            if r.status_code == 304:
-                # Upstream ignored the absent validators; nothing left to serve.
-                raise HTTPException(status_code=502, detail="upstream 304 but no stale cache")
+        metrics["cache_misses"] += 1
+        # fetch upstream — forward client's preference but accept either
+        assert http_client is not None
+        upstream_url = f"{settings.upstream_simple_url.rstrip('/')}/{canonical}/"
+        client_accept = request.headers.get("accept", "")
+        # If client explicitly wants JSON, ask upstream for JSON first; otherwise prefer what upstream has
+        if client_accept:
+            headers = {"Accept": client_accept}
         else:
-            # effective TTL respects upstream Cache-Control if present on 304
-            eff_ttl = effective_project_ttl(r.headers)
-            await cache.setex(cache_key, eff_ttl, stale_body)
-            # refresh etag/lastmod TTL
-            if etag:
-                await cache.setex(etag_key, stale_ttl, etag)
-            if last_mod:
-                await cache.setex(lastmod_key, stale_ttl, last_mod)
-            # also refresh opposite stale's TTL if exists
-            other_stale = await cache.get(f"{other_key}:stale")
-            if other_stale:
-                await cache.setex(other_key, eff_ttl, other_stale)
-            metrics["cache_hits"] += 1
-            metrics["upstream_fetches"] += 1
-            ct = "application/vnd.pypi.simple.v1+json" if wants_json else "text/html"
+            headers = {"Accept": "application/vnd.pypi.simple.v1+json, text/html;q=0.9"}
+
+        # conditional GET: send etag/last-modified if we have them from stale window
+        # Keys are per-canonical (not per-format) because upstream URL is same; representation
+        # validation still benefits from 304 even if we synthesize opposite format.
+        #
+        # Only revalidate when a stale body actually survives to serve on a 304.
+        # Validators are tiny and the bodies are large, so a Redis running
+        # maxmemory-policy allkeys-lru evicts the bodies first — sending a validator we
+        # cannot satisfy would turn that into a hard 502 for the rest of its TTL.
+        etag_key = f"simple:{canonical}:etag"
+        lastmod_key = f"simple:{canonical}:lastmod"
+        etag = None
+        last_mod = None
+        have_stale = (await cache.get(f"{cache_key}:stale")) is not None or (
+            await cache.get(f"{other_key}:stale")
+        ) is not None
+        if have_stale:
+            if etag := await cache.get(etag_key):
+                headers["If-None-Match"] = etag
+            if last_mod := await cache.get(lastmod_key):
+                headers["If-Modified-Since"] = last_mod
+
+        t0 = time.perf_counter()
+        try:
+            r = await http_client.get(upstream_url, headers=headers)
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"upstream error: {e}") from e
+
+        # 304 Not Modified — revalidate stale body
+        if r.status_code == 304:
+            stale_body = await cache.get(f"{cache_key}:stale")
+            if stale_body is None:
+                # fallback: try opposite stale then synthesize, or the other stale directly
+                other_stale = await cache.get(f"{other_key}:stale")
+                if other_stale is not None:
+                    try:
+                        if wants_json:
+                            proj = parse_simple_html(canonical, other_stale)
+                            stale_body = json.dumps(model_to_json(proj))
+                        else:
+                            proj = parse_simple_json(json.loads(other_stale))
+                            stale_body = model_to_html(proj)
+                        # cache synthesized stale as well
+                        await cache.setex(f"{other_key}:stale", stale_ttl, other_stale)
+                    except (ValueError, TypeError, KeyError):
+                        stale_body = None
+            if stale_body is None:
+                # Stale copy vanished between the have_stale check and now (TTL expiry or
+                # eviction). Drop the validators and refetch unconditionally rather than
+                # failing a request we can still satisfy.
+                logger.warning(
+                    "304 for %s with no stale body; refetching unconditionally", canonical
+                )
+                headers.pop("If-None-Match", None)
+                headers.pop("If-Modified-Since", None)
+                try:
+                    r = await http_client.get(upstream_url, headers=headers)
+                except httpx.HTTPError as e:
+                    raise HTTPException(status_code=502, detail=f"upstream error: {e}") from e
+                if r.status_code == 304:
+                    # Upstream ignored the absent validators; nothing left to serve.
+                    raise HTTPException(status_code=502, detail="upstream 304 but no stale cache")
+            else:
+                # effective TTL respects upstream Cache-Control if present on 304
+                eff_ttl = effective_project_ttl(r.headers)
+                await cache.setex(cache_key, eff_ttl, stale_body)
+                # refresh etag/lastmod TTL
+                if etag:
+                    await cache.setex(etag_key, stale_ttl, etag)
+                if last_mod:
+                    await cache.setex(lastmod_key, stale_ttl, last_mod)
+                # also refresh opposite stale's TTL if exists
+                other_stale = await cache.get(f"{other_key}:stale")
+                if other_stale:
+                    await cache.setex(other_key, eff_ttl, other_stale)
+                metrics["cache_hits"] += 1
+                metrics["upstream_fetches"] += 1
+                ct = "application/vnd.pypi.simple.v1+json" if wants_json else "text/html"
+                return Response(
+                    stale_body,
+                    media_type=ct,
+                    headers={
+                        "X-Cache": "REVALIDATED",
+                        "X-Cache-Key": canonical,
+                        "X-Synthesis": "0",
+                        "Server-Timing": f"revalidated;dur={(time.perf_counter() - start) * 1000:.1f}",
+                    },
+                )
+
+        if r.status_code == 404:
+            # Distinct key so a cached 404 never returns as a 200 HIT on the success path.
+            await cache.setex(not_found_key, settings.cache_404_ttl, "1")
+            raise HTTPException(
+                status_code=404,
+                detail=f"project {canonical} not found",
+                headers={"X-Cache": "MISS", "X-Cache-Key": canonical},
+            )
+        if r.status_code != 200:
+            raise HTTPException(status_code=r.status_code, detail=r.text[:500])
+        metrics["upstream_fetches"] += 1
+        upstream_time = (time.perf_counter() - t0) * 1000
+        ct = r.headers.get("content-type", "")
+        is_upstream_json = "json" in ct
+        eff_ttl = effective_project_ttl(r.headers)
+
+        # persist validator headers for next conditional GET
+        etag_val = r.headers.get("etag") or r.headers.get("ETag")
+        lastmod_val = r.headers.get("last-modified") or r.headers.get("Last-Modified")
+        if etag_val:
+            await cache.setex(etag_key, stale_ttl, etag_val)
+        if lastmod_val:
+            await cache.setex(lastmod_key, stale_ttl, lastmod_val)
+
+        # --- Passthrough path: upstream already has what client wants ---
+        # Store verbatim body for the matching format to avoid re-serialization loss (preserves PEP 700+ fields, whitespace, order)
+        # and only synthesize the opposite format. Add minimal overhead: 1 parse for opposite cache population.
+        if is_upstream_json == wants_json:
+            # perfect match — cache verbatim and synthesize opposite lazily
+            passthrough_body = r.text  # preserve upstream exactly
+            # store passthrough verbatim
+            await cache.setex(cache_key, eff_ttl, passthrough_body)
+            await cache.setex(f"{cache_key}:stale", stale_ttl, passthrough_body)
+            # synthesize opposite format once for next request (cost is one parse, not on critical path for this response)
+            try:
+                if is_upstream_json:
+                    proj = parse_simple_json(r.json())
+                    if not proj.name:
+                        proj.name = canonical
+                    opposite_body = model_to_html(proj)
+                else:
+                    proj = parse_simple_html(canonical, r.text)
+                    if not proj.name:
+                        proj.name = canonical
+                    opposite_body = json.dumps(model_to_json(proj))
+                await cache.setex(other_key, eff_ttl, opposite_body)
+                await cache.setex(f"{other_key}:stale", stale_ttl, opposite_body)
+            except (ValueError, TypeError, KeyError):
+                pass
+            out_ct = "application/vnd.pypi.simple.v1+json" if wants_json else "text/html"
+            total_ms = (time.perf_counter() - start) * 1000
             return Response(
-                stale_body,
-                media_type=ct,
+                passthrough_body,
+                media_type=out_ct,
                 headers={
-                    "X-Cache": "REVALIDATED",
-                    "X-Cache-Key": canonical,
-                    "X-Synthesis": "0",
-                    "Server-Timing": f"revalidated;dur={(time.perf_counter() - start) * 1000:.1f}",
+                    "X-Cache": "MISS",
+                    "X-Upstream-Time": f"{upstream_time:.1f}ms",
+                    "X-Synthesis": "0",  # no synthesis on the hot path
+                    "X-Upstream-Content-Type": ct,
+                    "Server-Timing": f"upstream;dur={upstream_time:.1f}, total;dur={total_ms:.1f}",
                 },
             )
 
-    if r.status_code == 404:
-        # Distinct key so a cached 404 never returns as a 200 HIT on the success path.
-        await cache.setex(not_found_key, settings.cache_404_ttl, "1")
-        raise HTTPException(
-            status_code=404,
-            detail=f"project {canonical} not found",
-            headers={"X-Cache": "MISS", "X-Cache-Key": canonical},
-        )
-    if r.status_code != 200:
-        raise HTTPException(status_code=r.status_code, detail=r.text[:500])
-    metrics["upstream_fetches"] += 1
-    upstream_time = (time.perf_counter() - t0) * 1000
-    ct = r.headers.get("content-type", "")
-    is_upstream_json = "json" in ct
-    eff_ttl = effective_project_ttl(r.headers)
+        # --- Synthesis path: upstream format != client want -> need to convert ---
+        if is_upstream_json:
+            try:
+                data = r.json()
+            except ValueError:
+                data = json.loads(r.text)
+            proj = parse_simple_json(data)
+            if not proj.name:
+                proj.name = canonical
+            # synthesize HTML for client, but also cache upstream JSON verbatim
+            await cache.setex(f"simple:{canonical}:json", eff_ttl, r.text)
+            await cache.setex(f"simple:{canonical}:json:stale", stale_ttl, r.text)
+            html_body = model_to_html(proj)
+            await cache.setex(f"simple:{canonical}:html", eff_ttl, html_body)
+            await cache.setex(f"simple:{canonical}:html:stale", stale_ttl, html_body)
+            body, out_ct = html_body, "text/html"
+        else:
+            proj = parse_simple_html(canonical, r.text)
+            if not proj.name:
+                proj.name = canonical
+            await cache.setex(f"simple:{canonical}:html", eff_ttl, r.text)
+            await cache.setex(f"simple:{canonical}:html:stale", stale_ttl, r.text)
+            json_body = json.dumps(model_to_json(proj))
+            await cache.setex(f"simple:{canonical}:json", eff_ttl, json_body)
+            await cache.setex(f"simple:{canonical}:json:stale", stale_ttl, json_body)
+            body, out_ct = json_body, "application/vnd.pypi.simple.v1+json"
 
-    # persist validator headers for next conditional GET
-    etag_val = r.headers.get("etag") or r.headers.get("ETag")
-    lastmod_val = r.headers.get("last-modified") or r.headers.get("Last-Modified")
-    if etag_val:
-        await cache.setex(etag_key, stale_ttl, etag_val)
-    if lastmod_val:
-        await cache.setex(lastmod_key, stale_ttl, lastmod_val)
-
-    # --- Passthrough path: upstream already has what client wants ---
-    # Store verbatim body for the matching format to avoid re-serialization loss (preserves PEP 700+ fields, whitespace, order)
-    # and only synthesize the opposite format. Add minimal overhead: 1 parse for opposite cache population.
-    if is_upstream_json == wants_json:
-        # perfect match — cache verbatim and synthesize opposite lazily
-        passthrough_body = r.text  # preserve upstream exactly
-        # store passthrough verbatim
-        await cache.setex(cache_key, eff_ttl, passthrough_body)
-        await cache.setex(f"{cache_key}:stale", stale_ttl, passthrough_body)
-        # synthesize opposite format once for next request (cost is one parse, not on critical path for this response)
-        try:
-            if is_upstream_json:
-                proj = parse_simple_json(r.json())
-                if not proj.name:
-                    proj.name = canonical
-                opposite_body = model_to_html(proj)
-            else:
-                proj = parse_simple_html(canonical, r.text)
-                if not proj.name:
-                    proj.name = canonical
-                opposite_body = json.dumps(model_to_json(proj))
-            await cache.setex(other_key, eff_ttl, opposite_body)
-            await cache.setex(f"{other_key}:stale", stale_ttl, opposite_body)
-        except (ValueError, TypeError, KeyError):
-            pass
-        out_ct = "application/vnd.pypi.simple.v1+json" if wants_json else "text/html"
+        metrics["synthesis_count"] += 1
         total_ms = (time.perf_counter() - start) * 1000
         return Response(
-            passthrough_body,
+            body,
             media_type=out_ct,
             headers={
                 "X-Cache": "MISS",
                 "X-Upstream-Time": f"{upstream_time:.1f}ms",
-                "X-Synthesis": "0",  # no synthesis on the hot path
+                "X-Synthesis": "1",
                 "X-Upstream-Content-Type": ct,
                 "Server-Timing": f"upstream;dur={upstream_time:.1f}, total;dur={total_ms:.1f}",
             },
         )
-
-    # --- Synthesis path: upstream format != client want -> need to convert ---
-    if is_upstream_json:
-        try:
-            data = r.json()
-        except ValueError:
-            data = json.loads(r.text)
-        proj = parse_simple_json(data)
-        if not proj.name:
-            proj.name = canonical
-        # synthesize HTML for client, but also cache upstream JSON verbatim
-        await cache.setex(f"simple:{canonical}:json", eff_ttl, r.text)
-        await cache.setex(f"simple:{canonical}:json:stale", stale_ttl, r.text)
-        html_body = model_to_html(proj)
-        await cache.setex(f"simple:{canonical}:html", eff_ttl, html_body)
-        await cache.setex(f"simple:{canonical}:html:stale", stale_ttl, html_body)
-        body, out_ct = html_body, "text/html"
-    else:
-        proj = parse_simple_html(canonical, r.text)
-        if not proj.name:
-            proj.name = canonical
-        await cache.setex(f"simple:{canonical}:html", eff_ttl, r.text)
-        await cache.setex(f"simple:{canonical}:html:stale", stale_ttl, r.text)
-        json_body = json.dumps(model_to_json(proj))
-        await cache.setex(f"simple:{canonical}:json", eff_ttl, json_body)
-        await cache.setex(f"simple:{canonical}:json:stale", stale_ttl, json_body)
-        body, out_ct = json_body, "application/vnd.pypi.simple.v1+json"
-
-    metrics["synthesis_count"] += 1
-    total_ms = (time.perf_counter() - start) * 1000
-    return Response(
-        body,
-        media_type=out_ct,
-        headers={
-            "X-Cache": "MISS",
-            "X-Upstream-Time": f"{upstream_time:.1f}ms",
-            "X-Synthesis": "1",
-            "X-Upstream-Content-Type": ct,
-            "Server-Timing": f"upstream;dur={upstream_time:.1f}, total;dur={total_ms:.1f}",
-        },
-    )
