@@ -18,6 +18,10 @@ from app.ttl import MIN_UPSTREAM_TTL_SECONDS, effective_project_ttl, parse_max_a
         (f"text/html, {CONTENT_TYPE_JSON};q=0", False),
         (f"{CONTENT_TYPE_JSON};q=0.0", False),
         ("application/vnd.pypi.simple.v1+json-not-really", False),
+        # media types are case-insensitive per RFC 9110
+        (CONTENT_TYPE_JSON.upper(), True),
+        # what pip actually sends
+        (f"{CONTENT_TYPE_JSON}, application/vnd.pypi.simple.v1+html;q=0.1, text/html;q=0.01", True),
     ],
 )
 def test_want_json(accept, expected):

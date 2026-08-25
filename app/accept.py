@@ -14,7 +14,8 @@ def want_json(accept: str | None) -> bool:
         return False
     for part in accept.split(","):
         media_type, _, params = part.strip().partition(";")
-        if media_type.strip() != CONTENT_TYPE_JSON:
+        # media types are case-insensitive (RFC 9110 8.3.1)
+        if media_type.strip().lower() != CONTENT_TYPE_JSON:
             continue
         for param in params.split(";"):
             key, _, value = param.partition("=")
