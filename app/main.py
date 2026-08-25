@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import time
 from contextlib import asynccontextmanager
 
@@ -10,9 +9,12 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import PlainTextResponse
 from packaging.utils import canonicalize_name
 
+from app.accept import want_json as accept_wants_json
 from app.cache import cache
 from app.config import settings
+from app.metrics import metrics, prometheus_text
 from app.parse import model_to_html, model_to_json, parse_simple_html, parse_simple_json
+from app.ttl import effective_project_ttl
 
 # shared httpx client
 http_client: httpx.AsyncClient | None = None
@@ -33,50 +35,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="python-proxy-cache", lifespan=lifespan)
-
-# simple in-memory metrics for perf harness
-metrics = {
-    "requests_total": 0,
-    "cache_hits": 0,
-    "cache_misses": 0,
-    "upstream_fetches": 0,
-    "synthesis_count": 0,
-}
-
-
-def _want_json(accept: str | None) -> bool:
-    if not accept:
-        return False
-    return "application/vnd.pypi.simple.v1+json" in accept
-
-
-def _parse_max_age(cache_control: str | None) -> int | None:
-    if not cache_control:
-        return None
-    # e.g. "public, max-age=600" or "max-age=60, must-revalidate"
-    m = re.search(r"max-age\s*=\s*(\d+)", cache_control, re.IGNORECASE)
-    if m:
-        try:
-            return int(m.group(1))
-        except ValueError:
-            return None
-    return None
-
-
-def _effective_project_ttl(headers: dict | httpx.Headers | None) -> int:
-    """Project TTL capped by upstream Cache-Control max-age when present."""
-    base = settings.cache_project_ttl_seconds
-    if headers is None:
-        return base
-    # headers may be httpx.Headers or dict
-    if hasattr(headers, "get"):
-        cc = headers.get("cache-control") or headers.get("Cache-Control")
-    else:
-        cc = None
-    max_age = _parse_max_age(cc)
-    if max_age is not None and max_age < base:
-        return max_age
-    return base
 
 
 @app.get("/health")
@@ -104,24 +62,7 @@ async def health():
 
 @app.get("/metrics")
 async def prom_metrics():
-    # minimal prometheus-style + json for bench
-    backend_code = {
-        "memory": 0,
-        "connected": 1,
-        "degraded": 2,
-        "disconnected": 3,
-    }.get(cache.state.value, -1)
-    lines = [
-        f"proxy_requests_total {metrics['requests_total']}",
-        f"proxy_cache_hits {metrics['cache_hits']}",
-        f"proxy_cache_misses {metrics['cache_misses']}",
-        f"proxy_upstream_fetches {metrics['upstream_fetches']}",
-        f"proxy_synthesis_count {metrics['synthesis_count']}",
-        f"proxy_cache_redis_errors_total {cache.redis_errors}",
-        f"proxy_cache_redis_probe_errors_total {cache.redis_probe_errors}",
-        f"proxy_cache_backend {backend_code}",
-    ]
-    return PlainTextResponse("\n".join(lines), media_type="text/plain")
+    return PlainTextResponse(prometheus_text(), media_type="text/plain")
 
 
 @app.get("/")
@@ -136,11 +77,11 @@ async def root():
 @app.get("/simple/")
 async def simple_index(request: Request, accept: str | None = Header(default=None)):
     metrics["requests_total"] += 1
-    want_json = _want_json(accept)
-    cache_key = f"simple:index:{'json' if want_json else 'html'}"
+    wants_json = accept_wants_json(accept)
+    cache_key = f"simple:index:{'json' if wants_json else 'html'}"
     if cached := await cache.get(cache_key):
         metrics["cache_hits"] += 1
-        ct = "application/vnd.pypi.simple.v1+json" if want_json else "text/html"
+        ct = "application/vnd.pypi.simple.v1+json" if wants_json else "text/html"
         return Response(cached, media_type=ct, headers={"X-Cache": "HIT", "X-Synthesis": "0"})
     metrics["cache_misses"] += 1
     # fetch upstream index (always HTML is the fallback)
@@ -162,7 +103,7 @@ async def simple_index(request: Request, accept: str | None = Header(default=Non
         projects = data.get("projects", [])
         # projects may be list of dicts with name
         names = [p["name"] if isinstance(p, dict) else p for p in projects]
-        if want_json:
+        if wants_json:
             body = json.dumps(
                 {
                     "projects": [{"name": n} for n in sorted(set(names))],
@@ -188,7 +129,7 @@ async def simple_index(request: Request, accept: str | None = Header(default=Non
             return Response(html, media_type="text/html", headers={"X-Cache": "MISS"})
     else:
         html = r.text
-        if want_json:
+        if wants_json:
             # parse html to extract names, synthesize json
             from bs4 import BeautifulSoup
 
@@ -216,12 +157,12 @@ async def simple_index(request: Request, accept: str | None = Header(default=Non
 async def simple_project(project: str, request: Request, accept: str | None = Header(default=None)):
     start = time.perf_counter()
     metrics["requests_total"] += 1
-    want_json = _want_json(accept)
+    wants_json = accept_wants_json(accept)
     canonical = canonicalize_name(project)
     # also handle non-canonical cache alias
-    cache_key = f"simple:{canonical}:{'json' if want_json else 'html'}"
+    cache_key = f"simple:{canonical}:{'json' if wants_json else 'html'}"
     # opposite format key for synthesis without refetch
-    other_key = f"simple:{canonical}:{'html' if want_json else 'json'}"
+    other_key = f"simple:{canonical}:{'html' if wants_json else 'json'}"
     project_ttl = settings.cache_project_ttl_seconds
     stale_ttl = settings.cache_stale_ttl_seconds
 
@@ -239,7 +180,7 @@ async def simple_project(project: str, request: Request, accept: str | None = He
 
     if cached := await cache.get(cache_key):
         metrics["cache_hits"] += 1
-        ct = "application/vnd.pypi.simple.v1+json" if want_json else "text/html"
+        ct = "application/vnd.pypi.simple.v1+json" if wants_json else "text/html"
         return Response(
             cached,
             media_type=ct,
@@ -256,7 +197,7 @@ async def simple_project(project: str, request: Request, accept: str | None = He
         metrics["synthesis_count"] += 1
         # parse other and convert
         try:
-            if want_json:
+            if wants_json:
                 # other is html -> json
                 proj = parse_simple_html(canonical, other_cached)
                 body = json.dumps(model_to_json(proj))
@@ -316,7 +257,7 @@ async def simple_project(project: str, request: Request, accept: str | None = He
             other_stale = await cache.get(f"{other_key}:stale")
             if other_stale is not None:
                 try:
-                    if want_json:
+                    if wants_json:
                         proj = parse_simple_html(canonical, other_stale)
                         stale_body = json.dumps(model_to_json(proj))
                     else:
@@ -329,7 +270,7 @@ async def simple_project(project: str, request: Request, accept: str | None = He
         if stale_body is None:
             raise HTTPException(status_code=502, detail="upstream 304 but no stale cache")
         # effective TTL respects upstream Cache-Control if present on 304
-        eff_ttl = _effective_project_ttl(r.headers)
+        eff_ttl = effective_project_ttl(r.headers)
         await cache.setex(cache_key, eff_ttl, stale_body)
         # refresh etag/lastmod TTL
         if etag:
@@ -342,7 +283,7 @@ async def simple_project(project: str, request: Request, accept: str | None = He
             await cache.setex(other_key, eff_ttl, other_stale)
         metrics["cache_hits"] += 1
         metrics["upstream_fetches"] += 1
-        ct = "application/vnd.pypi.simple.v1+json" if want_json else "text/html"
+        ct = "application/vnd.pypi.simple.v1+json" if wants_json else "text/html"
         return Response(
             stale_body,
             media_type=ct,
@@ -368,7 +309,7 @@ async def simple_project(project: str, request: Request, accept: str | None = He
     upstream_time = (time.perf_counter() - t0) * 1000
     ct = r.headers.get("content-type", "")
     is_upstream_json = "json" in ct
-    eff_ttl = _effective_project_ttl(r.headers)
+    eff_ttl = effective_project_ttl(r.headers)
 
     # persist validator headers for next conditional GET
     etag_val = r.headers.get("etag") or r.headers.get("ETag")
@@ -381,7 +322,7 @@ async def simple_project(project: str, request: Request, accept: str | None = He
     # --- Passthrough path: upstream already has what client wants ---
     # Store verbatim body for the matching format to avoid re-serialization loss (preserves PEP 700+ fields, whitespace, order)
     # and only synthesize the opposite format. Add minimal overhead: 1 parse for opposite cache population.
-    if is_upstream_json == want_json:
+    if is_upstream_json == wants_json:
         # perfect match — cache verbatim and synthesize opposite lazily
         passthrough_body = r.text  # preserve upstream exactly
         # store passthrough verbatim
@@ -403,7 +344,7 @@ async def simple_project(project: str, request: Request, accept: str | None = He
             await cache.setex(f"{other_key}:stale", stale_ttl, opposite_body)
         except (ValueError, TypeError, KeyError):
             pass
-        out_ct = "application/vnd.pypi.simple.v1+json" if want_json else "text/html"
+        out_ct = "application/vnd.pypi.simple.v1+json" if wants_json else "text/html"
         total_ms = (time.perf_counter() - start) * 1000
         return Response(
             passthrough_body,
