@@ -1,6 +1,6 @@
 from httpx import Response
 
-JSON_UPSTREAM = {
+JSON_UPSTREAM: dict = {
     "name": "requests",
     "files": [
         {
@@ -16,7 +16,7 @@ JSON_UPSTREAM = {
 
 
 async def test_passthrough_when_upstream_already_has_json(client, mock_upstream):
-    """Upstream already compliant JSON -> client wants JSON = no synthesis, verbatim body."""
+    """Upstream JSON + client JSON: URLs rewritten, every other field byte-identical."""
     mock_upstream(
         lambda url, headers=None: Response(
             200,
@@ -30,7 +30,11 @@ async def test_passthrough_when_upstream_already_has_json(client, mock_upstream)
     )
     assert r.status_code == 200
     assert r.headers.get("x-synthesis") == "0"
-    assert r.json() == JSON_UPSTREAM
+    data = r.json()
+    assert data["files"][0]["url"] == "/artifacts/files.pythonhosted.org/packages/a.whl"
+    # only the url changes; the rest of the document round-trips untouched
+    data["files"][0]["url"] = "https://files.pythonhosted.org/packages/a.whl"
+    assert data == JSON_UPSTREAM
 
     r2 = await client.get("/simple/requests/", headers={"Accept": "text/html"})
     assert r2.status_code == 200

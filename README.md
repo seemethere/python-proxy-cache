@@ -6,8 +6,8 @@ Designed to sit behind your existing `nginx` fleet for thousands of CI runners.
 
 ```
 runners -> nginx:8080 (cache) -> python-proxy:8000 (synthesis) -> PyPI / Nexus / Artifactory
-                    |-> /simple/*   5m cache, synthesis HTML<->JSON
-                    `-> /packages/* 30d cache, slice, sendfile
+                    |-> /simple/*     5m cache, synthesis HTML<->JSON, rewrite file URLs
+                    `-> /artifacts/<host>/*  30d cache, slice, sendfile (allowlisted hosts)
 ```
 
 ## Quick start
@@ -27,7 +27,9 @@ pip install --index-url http://localhost:8080/simple/ --trusted-host localhost r
 
 ## Config
 
-Env vars: `UPSTREAM_SIMPLE_URL` (default `https://pypi.org/simple`), `REDIS_URL`, `CACHE_TTL_SECONDS`.
+Env vars: `UPSTREAM_SIMPLE_URL` (default `https://pypi.org/simple`), `UPSTREAM_FILES_URL`
+(default `https://files.pythonhosted.org`), `ARTIFACT_HOST_ALLOWLIST` (comma-separated extra
+hosts for `/artifacts/` rewrite; keep `nginx/nginx.conf` `map $artifact_host` in sync), `REDIS_URL`, `CACHE_BACKEND`, `CACHE_TTL_SECONDS`.
 
 For legacy test: point `UPSTREAM_SIMPLE_URL` at a `pypiserver` that only returns HTML - JSON will be synthesized.
 

@@ -9,6 +9,8 @@ services:
     ports: ["8000:8000"]
     environment:
       UPSTREAM_SIMPLE_URL: "https://pypi.org/simple"
+      UPSTREAM_FILES_URL: "https://files.pythonhosted.org"
+      ARTIFACT_HOST_ALLOWLIST: ""
       REDIS_URL: "redis://redis:6379/0"
       CACHE_BACKEND: "redis"
       CACHE_TTL_SECONDS: "300"

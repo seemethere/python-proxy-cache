@@ -9,6 +9,7 @@ from fastapi import APIRouter, Header, HTTPException, Request, Response
 from packaging.utils import canonicalize_name
 
 from app.accept import want_json as accept_wants_json
+from app.artifacts import rewrite_project_urls, rewrite_simple_body
 from app.cache import cache
 from app.config import settings
 from app.deps import get_http_client
@@ -63,11 +64,11 @@ async def _try_serve_from_cache(
         try:
             if wants_json:
                 proj = parse_simple_html(canonical, other_cached)
-                body = json.dumps(model_to_json(proj))
+                body = json.dumps(model_to_json(rewrite_project_urls(proj)))
                 ct = "application/vnd.pypi.simple.v1+json"
             else:
                 proj = parse_simple_json(json.loads(other_cached))
-                body = model_to_html(proj)
+                body = model_to_html(rewrite_project_urls(proj))
                 ct = "text/html"
         except (ValueError, TypeError, KeyError):
             # unparseable cache entry — fall through to an upstream fetch
@@ -167,10 +168,10 @@ async def simple_project(project: str, request: Request, accept: str | None = He
                     try:
                         if wants_json:
                             proj = parse_simple_html(canonical, other_stale)
-                            stale_body = json.dumps(model_to_json(proj))
+                            stale_body = json.dumps(model_to_json(rewrite_project_urls(proj)))
                         else:
                             proj = parse_simple_json(json.loads(other_stale))
-                            stale_body = model_to_html(proj)
+                            stale_body = model_to_html(rewrite_project_urls(proj))
                         # cache synthesized stale as well
                         await cache.setex(f"{other_key}:stale", stale_ttl, other_stale)
                     except (ValueError, TypeError, KeyError):
@@ -247,8 +248,11 @@ async def simple_project(project: str, request: Request, accept: str | None = He
         # and only synthesize the opposite format. Add minimal overhead: 1 parse for opposite cache population.
         if is_upstream_json == wants_json:
             # perfect match — cache verbatim and synthesize opposite lazily
-            passthrough_body = r.text  # preserve upstream exactly
-            # store passthrough verbatim
+            # URL rewrite only — every other upstream field (PEP 700 versions,
+            # PEP 708 meta.tracks/alternate-locations, PEP 740 provenance, ordering,
+            # unknown keys) survives, so X-Synthesis: 0 stays truthful.
+            passthrough_body = rewrite_simple_body(r.text, is_json=is_upstream_json)
+            # store the rewritten passthrough
             await cache.setex(cache_key, eff_ttl, passthrough_body)
             await cache.setex(f"{cache_key}:stale", stale_ttl, passthrough_body)
             # synthesize opposite format once for next request (cost is one parse, not on critical path for this response)
@@ -257,12 +261,12 @@ async def simple_project(project: str, request: Request, accept: str | None = He
                     proj = parse_simple_json(r.json())
                     if not proj.name:
                         proj.name = canonical
-                    opposite_body = model_to_html(proj)
+                    opposite_body = model_to_html(rewrite_project_urls(proj))
                 else:
                     proj = parse_simple_html(canonical, r.text)
                     if not proj.name:
                         proj.name = canonical
-                    opposite_body = json.dumps(model_to_json(proj))
+                    opposite_body = json.dumps(model_to_json(rewrite_project_urls(proj)))
                 await cache.setex(other_key, eff_ttl, opposite_body)
                 await cache.setex(f"{other_key}:stale", stale_ttl, opposite_body)
             except (ValueError, TypeError, KeyError):
@@ -290,10 +294,11 @@ async def simple_project(project: str, request: Request, accept: str | None = He
             proj = parse_simple_json(data)
             if not proj.name:
                 proj.name = canonical
-            # synthesize HTML for client, but also cache upstream JSON verbatim
-            await cache.setex(f"simple:{canonical}:json", eff_ttl, r.text)
-            await cache.setex(f"simple:{canonical}:json:stale", stale_ttl, r.text)
-            html_body = model_to_html(proj)
+            # cache the upstream JSON with URLs rewritten but all other fields intact
+            json_body = rewrite_simple_body(r.text, is_json=True)
+            await cache.setex(f"simple:{canonical}:json", eff_ttl, json_body)
+            await cache.setex(f"simple:{canonical}:json:stale", stale_ttl, json_body)
+            html_body = model_to_html(rewrite_project_urls(proj))
             await cache.setex(f"simple:{canonical}:html", eff_ttl, html_body)
             await cache.setex(f"simple:{canonical}:html:stale", stale_ttl, html_body)
             body, out_ct = html_body, "text/html"
@@ -301,9 +306,10 @@ async def simple_project(project: str, request: Request, accept: str | None = He
             proj = parse_simple_html(canonical, r.text)
             if not proj.name:
                 proj.name = canonical
-            await cache.setex(f"simple:{canonical}:html", eff_ttl, r.text)
-            await cache.setex(f"simple:{canonical}:html:stale", stale_ttl, r.text)
-            json_body = json.dumps(model_to_json(proj))
+            html_body = rewrite_simple_body(r.text, is_json=False)
+            await cache.setex(f"simple:{canonical}:html", eff_ttl, html_body)
+            await cache.setex(f"simple:{canonical}:html:stale", stale_ttl, html_body)
+            json_body = json.dumps(model_to_json(rewrite_project_urls(proj)))
             await cache.setex(f"simple:{canonical}:json", eff_ttl, json_body)
             await cache.setex(f"simple:{canonical}:json:stale", stale_ttl, json_body)
             body, out_ct = json_body, "application/vnd.pypi.simple.v1+json"
