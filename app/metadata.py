@@ -5,7 +5,7 @@ import json
 import logging
 from urllib.parse import urlparse
 
-from app.artifacts import host_allowed, rewrite_project_urls
+from app.artifacts import authority_of, host_allowed, rewrite_project_urls
 from app.cache import cache
 from app.config import settings
 from app.deps import get_http_client
@@ -36,7 +36,7 @@ def _scheme_for(host: str) -> str:
     extra allowlisted hosts (an internal index may well be plain http).
     """
     files = urlparse(settings.upstream_files_url)
-    if files.hostname and host.lower() == files.hostname.lower():
+    if files.hostname and host.lower() == authority_of(files):
         return files.scheme or "https"
     return settings.artifact_host_scheme
 
@@ -60,7 +60,7 @@ def metadata_head_url(file_url: str) -> str | None:
     parsed = urlparse(base)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         return None
-    if not host_allowed(parsed.hostname):
+    if not host_allowed(authority_of(parsed)):
         # Not rewritten because it is off-allowlist — do not probe it either.
         return None
     return base + ".metadata"

@@ -196,3 +196,16 @@ async def test_head_concurrency_is_globally_bounded(monkeypatch):
     # five projects enriching at once
     await asyncio.gather(*(meta._enrich(f"proj{i}", html, is_json=False, ttl=60) for i in range(5)))
     assert peak <= 3, f"peak concurrent HEADs was {peak}, expected <= 3"
+
+
+def test_metadata_probe_respects_port_in_authority(monkeypatch):
+    """Probes must target the same authority the rewrite emitted, port included."""
+    monkeypatch.setattr(settings, "artifact_host_allowlist", "nexus.internal:8081")
+    monkeypatch.setattr(settings, "artifact_host_scheme", "http")
+    assert (
+        metadata_head_url("/artifacts/nexus.internal:8081/repo/a.whl")
+        == "http://nexus.internal:8081/repo/a.whl.metadata"
+    )
+    # a different port on the same host is not authorised
+    assert metadata_head_url("/artifacts/nexus.internal:9999/repo/a.whl") is None
+    assert metadata_head_url("http://nexus.internal:9999/repo/a.whl") is None

@@ -1,0 +1,35 @@
+# Integration stack: real nginx + real image, pointed at a fake upstream so the
+# assertions are deterministic and we never hit pypi.org.
+services:
+  fake-upstream:
+    image: python:3.11-slim
+    command: python /srv/upstream.py
+    volumes:
+      - ./upstream.py:/srv/upstream.py:ro
+    networks:
+      default:
+        aliases: [fake-files]
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no
+
+  python-proxy:
+    build:
+      context: ../..
+    environment:
+      UPSTREAM_SIMPLE_URL: "http://fake-upstream:9100/simple"
+      UPSTREAM_FILES_URL: "http://fake-files:9100"
+      ARTIFACT_HOST_ALLOWLIST: "fake-files:9100"
+      ARTIFACT_HOST_SCHEME: "http"
+      REDIS_URL: "redis://redis:6379/0"
+      CACHE_BACKEND: "redis"
+      ENABLE_BACKGROUND_METADATA: "true"
+    depends_on: [redis, fake-upstream]
+
+  nginx:
+    image: nginx:alpine
+    ports: ["18080:80"]
+    volumes:
+      - ./nginx.it.conf:/etc/nginx/nginx.conf:ro
+    depends_on: [python-proxy]
