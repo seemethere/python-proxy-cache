@@ -40,7 +40,7 @@ jobs:
       - name: Prek (all files)
         uses: j178/prek-action@v1
         with:
-          extra-args: run --all-files
+          extra-args: --all-files
 
   docker:
     runs-on: ubuntu-latest
