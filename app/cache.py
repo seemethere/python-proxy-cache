@@ -21,8 +21,9 @@ CacheBackendName = Literal["memory", "redis", "redis_required"]
 
 class CacheState(StrEnum):
     MEMORY = "memory"
+    DISCONNECTED = "disconnected"  # redis configured, not yet connected
     CONNECTED = "connected"
-    DEGRADED = "degraded"
+    DEGRADED = "degraded"  # redis was configured but failed; may reconnect
 
 
 class Cache:
@@ -54,8 +55,7 @@ class Cache:
 
         try:
             self._redis = redis.from_url(self.url, decode_responses=True, socket_connect_timeout=1)
-            # Not connected yet — ping() in connect() / lifespan.
-            self.state = CacheState.DEGRADED
+            self.state = CacheState.DISCONNECTED
         except Exception:
             self._redis = None
             if self.backend == "redis_required":
@@ -65,38 +65,58 @@ class Cache:
 
     async def connect(self) -> None:
         """Eager ping. Call from app lifespan."""
-        if self.backend == "memory" or self._redis is None:
+        if self.backend == "memory":
             self.state = CacheState.MEMORY
             return
+        if not await self.reconnect() and self.backend == "redis_required":
+            raise RuntimeError("redis required but connect/ping failed")
+
+    async def reconnect(self) -> bool:
+        """(Re)build Redis client and ping. Used after degrade or at startup."""
+        if self.backend == "memory" or not HAS_REDIS:
+            self.state = CacheState.MEMORY
+            return False
         try:
+            if self._redis is None:
+                self._redis = redis.from_url(
+                    self.url, decode_responses=True, socket_connect_timeout=1
+                )
             await self._redis.ping()
             self.state = CacheState.CONNECTED
+            return True
         except Exception:
             self.redis_errors += 1
-            logger.exception("redis ping failed")
-            if self.backend == "redis_required":
-                self.state = CacheState.DEGRADED
-                raise
-            # Soft degrade: stop using redis for this process.
+            logger.exception("redis reconnect/ping failed")
             self._redis = None
             self.state = CacheState.DEGRADED
+            return False
 
     def _degrade(self, exc: Exception) -> None:
         self.redis_errors += 1
-        logger.warning("redis error (%s); degrading to in-memory for this process", exc)
+        logger.warning("redis error (%s); degrading to in-memory until reconnect", exc)
         self._redis = None
         self.state = CacheState.DEGRADED
 
-    async def ping(self) -> bool:
-        if self._redis is None:
+    async def health_ping(self) -> bool:
+        """Non-mutating probe for /health. Does not clear the Redis client on failure.
+
+        If currently degraded, attempts a reconnect (recover from transient outages).
+        """
+        if self.backend == "memory":
             return False
+        if self.state == CacheState.DEGRADED or self._redis is None:
+            return await self.reconnect()
         try:
             await self._redis.ping()
             self.state = CacheState.CONNECTED
             return True
-        except Exception as e:
-            self._degrade(e)
+        except Exception:
+            # Leave client in place; request path may still degrade on use.
             return False
+
+    async def ping(self) -> bool:
+        """Legacy alias used by older callers; prefer health_ping for /health."""
+        return await self.health_ping()
 
     async def get(self, key: str) -> str | None:
         if self._redis is not None:

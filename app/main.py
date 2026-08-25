@@ -81,7 +81,7 @@ def _effective_project_ttl(headers: dict | httpx.Headers | None) -> int:
 
 @app.get("/health")
 async def health():
-    redis_ok = await cache.ping()
+    redis_ok = await cache.health_ping()
     ready = True
     if settings.cache_backend == "redis_required" and not redis_ok:
         ready = False
@@ -105,7 +105,12 @@ async def health():
 @app.get("/metrics")
 async def prom_metrics():
     # minimal prometheus-style + json for bench
-    backend_code = {"memory": 0, "connected": 1, "degraded": 2}.get(cache.state.value, -1)
+    backend_code = {
+        "memory": 0,
+        "connected": 1,
+        "degraded": 2,
+        "disconnected": 3,
+    }.get(cache.state.value, -1)
     lines = [
         f"proxy_requests_total {metrics['requests_total']}",
         f"proxy_cache_hits {metrics['cache_hits']}",

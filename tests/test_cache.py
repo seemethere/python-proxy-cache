@@ -74,12 +74,24 @@ async def test_redis_set_failure_writes_memory():
 
 
 @pytest.mark.asyncio
-async def test_ping_false_when_redis_errors():
+async def test_health_ping_does_not_degrade_on_transient_failure():
     c = Cache(backend="redis")
     fake = FakeRedis(fail_ping=True)
     c._redis = fake  # ty: ignore[invalid-assignment]
     c.state = CacheState.CONNECTED
-    assert await c.ping() is False
+    assert await c.health_ping() is False
+    # Client must remain so a later successful ping can recover without reconnect().
+    assert c._redis is fake
+    assert c.state == CacheState.CONNECTED
+
+
+@pytest.mark.asyncio
+async def test_ping_false_when_degraded_reconnect_fails():
+    c = Cache(backend="redis")
+    c._redis = None
+    c.state = CacheState.DEGRADED
+    # reconnect will try real redis URL and fail in tests -> still degraded
+    assert await c.health_ping() is False
     assert c.state == CacheState.DEGRADED
 
 
@@ -89,6 +101,24 @@ async def test_connect_ping_success():
     fake = FakeRedis()
     c._redis = fake  # ty: ignore[invalid-assignment]
     await c.connect()
+    assert c.state == CacheState.CONNECTED
+
+
+@pytest.mark.asyncio
+async def test_reconnect_after_degrade():
+    c = Cache(backend="redis")
+    c._redis = None
+    c.state = CacheState.DEGRADED
+    fake = FakeRedis()
+
+    async def fake_reconnect():
+        c._redis = fake  # ty: ignore[invalid-assignment]
+        await fake.ping()
+        c.state = CacheState.CONNECTED
+        return True
+
+    c.reconnect = fake_reconnect  # ty: ignore[invalid-assignment]
+    assert await c.health_ping() is True
     assert c.state == CacheState.CONNECTED
 
 
