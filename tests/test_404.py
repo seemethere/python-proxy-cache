@@ -12,6 +12,7 @@ async def test_404_cached_stays_404(client, mock_upstream):
         "/simple/missing-pkg/", headers={"Accept": "application/vnd.pypi.simple.v1+json"}
     )
     assert r1.status_code == 404
+    assert r1.headers.get("x-cache") == "MISS"
     assert rec.call_count == 1
 
     r2 = await client.get(
