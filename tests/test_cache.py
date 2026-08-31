@@ -162,3 +162,23 @@ async def test_health_includes_cache_fields(client):
     body = (await client.get("/metrics")).text
     assert "proxy_cache_redis_errors_total" in body
     assert "proxy_cache_redis_probe_errors_total" in body
+
+
+@pytest.mark.asyncio
+async def test_required_redis_health_reports_failed_current_probe(client, monkeypatch):
+    from app.cache import cache
+
+    async def failed_ping() -> bool:
+        return False
+
+    monkeypatch.setattr(cache, "backend", "redis_required")
+    monkeypatch.setattr(cache, "state", CacheState.CONNECTED)
+    monkeypatch.setattr(cache, "health_ping", failed_ping)
+
+    response = await client.get("/health")
+
+    assert response.status_code == 503
+    assert response.json()["redis"] is False
+    assert response.json()["cache_state"] == "degraded"
+    # Reporting the failed probe does not discard a potentially recoverable client.
+    assert cache.state == CacheState.CONNECTED

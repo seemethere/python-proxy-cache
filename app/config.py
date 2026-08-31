@@ -25,8 +25,8 @@ class Settings(BaseSettings):
     )
     http_timeout: float = 10.0
     enable_background_metadata: bool = False  # HEAD .metadata for 658/714 (off by default, lazy)
-    # Global caps for background metadata probing, not per-project: without them a
-    # burst of misses puts (projects x files) HEADs on upstream at once.
+    # Global cap for complete per-file metadata probes, including cache operations
+    # and upstream HEADs. Without it, one large project can exhaust either pool.
     metadata_head_concurrency: int = 10
     metadata_max_inflight_projects: int = 4
     # Hard bound on scheduled enrichment tasks (running plus queued).

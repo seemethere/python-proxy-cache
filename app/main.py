@@ -7,7 +7,7 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import PlainTextResponse
 
-from app.cache import cache
+from app.cache import CacheState, cache
 from app.config import settings
 from app.metadata_route import router as metadata_router
 from app.metrics import metrics, prometheus_text
@@ -59,6 +59,12 @@ async def health():
     ready = True
     if cache.backend == "redis_required" and not redis_ok:
         ready = False
+    reported_cache_state = cache.state
+    if cache.backend != "memory" and not redis_ok:
+        # health_ping deliberately retains an existing client after a transient
+        # failure, but the response must describe this probe rather than the
+        # last successful request-path state.
+        reported_cache_state = CacheState.DEGRADED
     status = "ok" if ready else "degraded"
     code = 200 if ready else 503
     return Response(
@@ -67,7 +73,7 @@ async def health():
                 "status": status,
                 "redis": redis_ok,
                 "cache_backend": cache.backend,
-                "cache_state": cache.state.value,
+                "cache_state": reported_cache_state.value,
                 "metrics": metrics,
             }
         ),

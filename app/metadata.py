@@ -8,7 +8,7 @@ import re
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
-from packaging.utils import InvalidWheelFilename, parse_wheel_filename
+from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel_filename
 from packaging.version import Version
 
 from app.artifacts import authority_of, host_allowed, rewrite_project_urls
@@ -30,15 +30,15 @@ logger = logging.getLogger(__name__)
 
 _HEAD_TIMEOUT = 5.0
 
-# Global, not per-task: a per-enrichment semaphore caps each project at N in
-# flight but leaves total concurrency unbounded across projects, so a CI burst
-# over 200 projects would put 200*N HEADs on upstream at once.
-_head_semaphore = asyncio.Semaphore(settings.metadata_head_concurrency)
+# Bound the complete per-file probe, including Redis lookups. Limiting only the
+# upstream HEAD would still let a large project open one cache operation per
+# file concurrently before any task reached the HEAD limit.
+_probe_semaphore = asyncio.Semaphore(settings.metadata_head_concurrency)
 _extract_semaphore = asyncio.Semaphore(settings.metadata_extract_concurrency)
 # Same reasoning for the tasks themselves — one enrichment per miss with no cap
 # lets a miss storm spawn unbounded background work with no back-pressure.
 _task_semaphore = asyncio.Semaphore(settings.metadata_max_inflight_projects)
-_pending: set[asyncio.Task] = set()
+_pending: dict[str, asyncio.Task] = {}
 
 
 def _scheme_for(host: str) -> str:
@@ -202,19 +202,28 @@ async def _extract_wheel_metadata(url: str) -> bytes:
 def schedule_metadata_enrichment(canonical: str, body: str, *, is_json: bool, ttl: int) -> None:
     if not settings.enable_background_metadata:
         return
+    canonical = canonicalize_name(canonical)
+    existing = _pending.get(canonical)
+    if existing is not None and not existing.done():
+        return
     if len(_pending) >= max(0, settings.metadata_max_pending_projects):
         metrics["metadata_enrichment_dropped"] += 1
         logger.warning("metadata enrichment queue full; dropping %s", canonical)
         return
     task = asyncio.create_task(_enrich(canonical, body, is_json=is_json, ttl=ttl))
-    _pending.add(task)
-    task.add_done_callback(_pending.discard)
+    _pending[canonical] = task
+
+    def remove_if_current(done: asyncio.Task) -> None:
+        if _pending.get(canonical) is done:
+            _pending.pop(canonical, None)
+
+    task.add_done_callback(remove_if_current)
 
 
 async def drain_metadata_tasks() -> None:
     """Wait for in-flight enrichment tasks (tests)."""
     while _pending:
-        await asyncio.gather(*list(_pending), return_exceptions=True)
+        await asyncio.gather(*list(_pending.values()), return_exceptions=True)
 
 
 def _needs_probe(f: File) -> bool:
@@ -228,6 +237,11 @@ def _needs_probe(f: File) -> bool:
 
 
 async def _probe(f: File, *, allow_extraction: bool = True) -> File:
+    async with _probe_semaphore:
+        return await _probe_with_permit(f, allow_extraction=allow_extraction)
+
+
+async def _probe_with_permit(f: File, *, allow_extraction: bool) -> File:
     if not _needs_probe(f):
         return f
     wheel_sha256 = f.hashes.get("sha256", "").lower()
@@ -241,13 +255,12 @@ async def _probe(f: File, *, allow_extraction: bool = True) -> File:
     url = metadata_head_url(f.url)
     if url is None:
         return f
-    async with _head_semaphore:
-        try:
-            client = get_http_client()
-            r = await asyncio.wait_for(client.head(url), timeout=_HEAD_TIMEOUT)
-        except Exception:
-            logger.debug("metadata HEAD failed for %s", _safe_url_for_log(url), exc_info=True)
-            r = None
+    try:
+        client = get_http_client()
+        r = await asyncio.wait_for(client.head(url), timeout=_HEAD_TIMEOUT)
+    except Exception:
+        logger.debug("metadata HEAD failed for %s", _safe_url_for_log(url), exc_info=True)
+        r = None
     metrics["metadata_heads"] += 1
     core_metadata: bool | dict[str, str]
     if r is not None and r.status_code == 200:
@@ -331,16 +344,15 @@ def _advertise_metadata(body: str, *, is_json: bool, files: list[File]) -> str:
 
 
 def _extraction_candidate_indexes(files: list[File]) -> set[int]:
-    """Select a bounded set of newest valid wheels for extraction.
+    """Select a bounded set of newest valid wheels missing metadata.
 
     Sorting is stable, so files for the same release retain upstream order.
-    Invalid/non-wheel filenames can still be HEAD-probed but are never handed
-    to the ZIP extractor.
+    Files which already advertise upstream metadata are left untouched.
     """
     limit = max(0, settings.metadata_max_extract_files_per_project)
     ranked: list[tuple[Version, int]] = []
     for index, file in enumerate(files):
-        if not file.filename.lower().endswith(".whl"):
+        if not _needs_probe(file) or not file.filename.lower().endswith(".whl"):
             continue
         try:
             _, version, _, _ = parse_wheel_filename(file.filename)
@@ -362,14 +374,13 @@ async def _enrich(canonical: str, body: str, *, is_json: bool, ttl: int) -> None
                 proj.name = canonical
 
             extraction_candidates = _extraction_candidate_indexes(proj.files)
-            new_files = list(
-                await asyncio.gather(
-                    *(
-                        _probe(file, allow_extraction=index in extraction_candidates)
-                        for index, file in enumerate(proj.files)
-                    )
-                )
+            new_files = list(proj.files)
+            candidate_indexes = sorted(extraction_candidates)
+            probed_files = await asyncio.gather(
+                *(_probe(proj.files[index]) for index in candidate_indexes)
             )
+            for index, probed_file in zip(candidate_indexes, probed_files, strict=True):
+                new_files[index] = probed_file
             changed = any(
                 not _needs_probe(nf) and _needs_probe(of)
                 for nf, of in zip(new_files, proj.files, strict=True)
