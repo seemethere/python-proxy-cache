@@ -4,11 +4,12 @@ import json
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import PlainTextResponse
 
 from app.cache import cache
 from app.config import settings
+from app.metadata_route import router as metadata_router
 from app.metrics import metrics, prometheus_text
 from app.simple_index import router as simple_index_router
 from app.simple_project import router as simple_project_router
@@ -34,6 +35,22 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="python-proxy-cache", lifespan=lifespan)
 app.include_router(simple_index_router)
 app.include_router(simple_project_router)
+app.include_router(metadata_router)
+
+
+@app.middleware("http")
+async def metadata_enrichment_cache_control(request: Request, call_next):
+    response = await call_next(request)
+    # The first response can be returned before background extraction updates
+    # Redis. Do not let an outer proxy retain that unenriched project page and
+    # hide the completed result. The root project listing is not enriched.
+    if (
+        settings.enable_background_metadata
+        and request.url.path.startswith("/simple/")
+        and request.url.path != "/simple/"
+    ):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/health")

@@ -53,3 +53,48 @@ def test_roundtrip():
     proj2 = parse_simple_json(j)
     assert len(proj2.files) == len(proj.files)
     assert proj2.files[0].filename == proj.files[0].filename
+
+
+def test_html_metadata_hash_becomes_json_hash_object():
+    html = '<a href="demo.whl#sha256=abc" data-core-metadata="sha256=deadbeef">demo.whl</a>'
+    data = model_to_json(parse_simple_html("demo", html))
+    assert data["files"][0]["core-metadata"] == {"sha256": "deadbeef"}
+
+
+def test_json_metadata_hash_object_emits_one_html_hash_preferring_sha256():
+    project = parse_simple_json(
+        {
+            "name": "demo",
+            "files": [
+                {
+                    "filename": "demo.whl",
+                    "url": "demo.whl",
+                    "hashes": {},
+                    "core-metadata": {"sha512": "other", "sha256": "preferred"},
+                }
+            ],
+        }
+    )
+    html = model_to_html(project)
+    assert 'data-core-metadata="sha256=preferred"' in html
+    assert "sha512=other" not in html
+    assert "," not in html
+
+
+def test_json_metadata_hash_object_uses_supported_fallback_hash():
+    project = parse_simple_json(
+        {
+            "name": "demo",
+            "files": [
+                {
+                    "filename": "demo.whl",
+                    "url": "demo.whl",
+                    "hashes": {},
+                    "dist-info-metadata": {"unknown": "ignore", "sha512": "fallback"},
+                }
+            ],
+        }
+    )
+    html = model_to_html(project)
+    assert 'data-dist-info-metadata="sha512=fallback"' in html
+    assert "unknown=ignore" not in html

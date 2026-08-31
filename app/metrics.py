@@ -11,6 +11,9 @@ metrics = {
     "synthesis_count": 0,
     "metadata_heads": 0,
     "metadata_enrichments": 0,
+    "metadata_enrichment_dropped": 0,
+    "metadata_extractions": 0,
+    "metadata_extraction_failures": 0,
 }
 
 _BACKEND_CODES = {"memory": 0, "connected": 1, "degraded": 2, "disconnected": 3}
@@ -26,6 +29,9 @@ def prometheus_text() -> str:
         f"proxy_synthesis_count {metrics['synthesis_count']}",
         f"proxy_metadata_heads_total {metrics['metadata_heads']}",
         f"proxy_metadata_enrichments_total {metrics['metadata_enrichments']}",
+        f"proxy_metadata_enrichment_dropped_total {metrics['metadata_enrichment_dropped']}",
+        f"proxy_metadata_extractions_total {metrics['metadata_extractions']}",
+        f"proxy_metadata_extraction_failures_total {metrics['metadata_extraction_failures']}",
         f"proxy_cache_redis_errors_total {cache.redis_errors}",
         f"proxy_cache_redis_probe_errors_total {cache.redis_probe_errors}",
         f"proxy_cache_backend {backend_code}",

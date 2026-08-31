@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+MetadataValue = bool | str | dict[str, str] | None
+
 
 @dataclass
 class File:
@@ -10,8 +12,8 @@ class File:
     hashes: dict[str, str] = field(default_factory=dict)
     requires_python: str | None = None
     yanked: bool | str | None = None  # False, True, or reason string
-    dist_info_metadata: bool | str | None = None  # PEP 658: true/false or hash dict
-    core_metadata: bool | str | None = None  # PEP 714 rename
+    dist_info_metadata: MetadataValue = None  # PEP 658: bool or hash dict
+    core_metadata: MetadataValue = None  # PEP 714 rename
     size: int | None = None
     upload_time: str | None = None
 

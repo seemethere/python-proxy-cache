@@ -29,6 +29,21 @@ class Settings(BaseSettings):
     # burst of misses puts (projects x files) HEADs on upstream at once.
     metadata_head_concurrency: int = 10
     metadata_max_inflight_projects: int = 4
+    # Hard bound on scheduled enrichment tasks (running plus queued).
+    metadata_max_pending_projects: int = 16
+    metadata_extract_concurrency: int = 2
+    # Maximum wheels extracted during one project enrichment. Upstream metadata
+    # HEAD probes remain uncapped by this setting (but concurrency-bounded).
+    metadata_max_extract_files_per_project: int = 32
+    # Wheels are immutable and this data is content-addressed, so keep generated
+    # metadata much longer than the mutable project index that advertises it.
+    metadata_cache_ttl_seconds: int = 365 * 24 * 60 * 60
+    # Avoid repeatedly retrying wheels that are malformed or do not support the
+    # range requests required for bounded extraction.
+    metadata_failure_ttl_seconds: int = 60 * 60
+    # Base URL of the nginx artifact cache. When unset, extraction talks to the
+    # allowlisted upstream artifact host directly.
+    metadata_artifact_base_url: str = ""
     # Scheme used to reach extra allowlisted artifact hosts (the /artifacts/ path
     # has lost the original scheme); the upstream_files_url host keeps its own.
     artifact_host_scheme: Literal["https", "http"] = "https"

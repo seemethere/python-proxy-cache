@@ -7,6 +7,26 @@ from bs4 import BeautifulSoup
 from app.models import File, Project
 
 
+def metadata_value_to_html(value: bool | str | dict[str, str] | None) -> str | None:
+    """Render one PEP 658/714 HTML attribute value.
+
+    HTML permits one hash, unlike the JSON mapping. Prefer SHA256 and otherwise
+    use the first upstream-provided algorithm.
+    """
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict) and value:
+        for algorithm in ("sha256", "sha384", "sha512", "blake2b", "sha1", "md5"):
+            digest = value.get(algorithm)
+            if digest:
+                return f"{algorithm}={digest}"
+    return None
+
+
 def _parse_hashes(url: str) -> dict[str, str]:
     if "#" not in url:
         return {}
@@ -71,6 +91,13 @@ def parse_simple_html(project_name: str, html: str) -> Project:
                 return True
             if v.lower() == "false":
                 return False
+            # HTML uses ``hash-name=hex-digest`` while PEP 691 represents the
+            # same value as an object. Normalise here so HTML -> JSON synthesis
+            # emits the correct shape.
+            if "=" in v:
+                algorithm, digest = v.split("=", 1)
+                if algorithm and digest:
+                    return {algorithm: digest}
             return v  # hash value
 
         # data-yanked: "" or "true" or reason string. spec: absence = not yanked
@@ -169,16 +196,12 @@ def model_to_html(project: Project) -> str:
         elif isinstance(f.yanked, str) and f.yanked:
             attrs.append(f'data-yanked="{_esc(f.yanked)}"')
         # core-metadata takes precedence per PEP 714
-        if f.core_metadata is True:
-            attrs.append('data-core-metadata="true"')
-        elif f.core_metadata is False:
-            attrs.append('data-core-metadata="false"')
-        elif isinstance(f.core_metadata, str):
-            attrs.append(f'data-core-metadata="{_esc(f.core_metadata)}"')
-        elif f.dist_info_metadata is True:
-            attrs.append('data-dist-info-metadata="true"')
-        elif f.dist_info_metadata is False:
-            attrs.append('data-dist-info-metadata="false"')
+        core_metadata = metadata_value_to_html(f.core_metadata)
+        dist_info_metadata = metadata_value_to_html(f.dist_info_metadata)
+        if core_metadata is not None:
+            attrs.append(f'data-core-metadata="{_esc(core_metadata)}"')
+        elif dist_info_metadata is not None:
+            attrs.append(f'data-dist-info-metadata="{_esc(dist_info_metadata)}"')
         else:
             # synthesized missing -> false
             if f.core_metadata is None and f.dist_info_metadata is None:
