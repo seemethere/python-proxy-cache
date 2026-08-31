@@ -130,7 +130,8 @@ async def test_metadata_probe_on_enriches_cache(client, mock_upstream, monkeypat
     monkeypatch.setattr(settings, "enable_background_metadata", True)
     html = (
         "<!DOCTYPE html><html><body>"
-        '<a href="https://files.pythonhosted.org/packages/a.whl#sha256=abc">a.whl</a>'
+        f'<a href="https://files.pythonhosted.org/packages/a-1.0-py3-none-any.whl'
+        f'#sha256={"a" * 64}">a-1.0-py3-none-any.whl</a>'
         "</body></html>"
     )
 
@@ -216,7 +217,7 @@ async def test_head_concurrency_is_globally_bounded(monkeypatch):
     import app.metadata as meta
 
     monkeypatch.setattr(settings, "enable_background_metadata", True)
-    monkeypatch.setattr(meta, "_head_semaphore", asyncio.Semaphore(3))
+    monkeypatch.setattr(meta, "_probe_semaphore", asyncio.Semaphore(3))
     monkeypatch.setattr(meta, "_task_semaphore", asyncio.Semaphore(10))
 
     live = 0
@@ -245,6 +246,43 @@ async def test_head_concurrency_is_globally_bounded(monkeypatch):
     # five projects enriching at once
     await asyncio.gather(*(meta._enrich(f"proj{i}", html, is_json=False, ttl=60) for i in range(5)))
     assert peak <= 3, f"peak concurrent HEADs was {peak}, expected <= 3"
+
+
+async def test_probe_concurrency_bounds_cache_lookups(monkeypatch):
+    import asyncio
+
+    import app.metadata as meta
+
+    monkeypatch.setattr(meta, "_probe_semaphore", asyncio.Semaphore(3))
+    live = 0
+    peak = 0
+
+    async def delayed_cache_get(key: str) -> None:
+        nonlocal live, peak
+        live += 1
+        peak = max(peak, live)
+        await asyncio.sleep(0.01)
+        live -= 1
+        return None
+
+    class FakeClient:
+        async def head(self, url):
+            return Response(200)
+
+    monkeypatch.setattr(cache, "get", delayed_cache_get)
+    monkeypatch.setattr(meta, "get_http_client", lambda: FakeClient())
+    files = [
+        File(
+            filename=f"demo-{index}.0-py3-none-any.whl",
+            url=f"/artifacts/files.pythonhosted.org/packages/demo-{index}.whl",
+            hashes={"sha256": f"{index:064x}"},
+        )
+        for index in range(12)
+    ]
+
+    await asyncio.gather(*(meta._probe(file) for file in files))
+
+    assert peak <= 3, f"peak concurrent cache lookups was {peak}, expected <= 3"
 
 
 def test_metadata_probe_respects_port_in_authority(monkeypatch):
@@ -448,6 +486,40 @@ async def test_enrichment_schedule_has_hard_pending_bound(monkeypatch):
     await drain_metadata_tasks()
 
 
+async def test_enrichment_schedule_coalesces_canonical_project(monkeypatch):
+    import asyncio
+
+    import app.metadata as meta
+
+    await drain_metadata_tasks()
+    monkeypatch.setattr(settings, "enable_background_metadata", True)
+    monkeypatch.setattr(settings, "metadata_max_pending_projects", 1)
+    release = asyncio.Event()
+    calls: list[str] = []
+
+    async def blocked_enrich(canonical: str, body: str, *, is_json: bool, ttl: int) -> None:
+        calls.append(canonical)
+        await release.wait()
+
+    monkeypatch.setattr(meta, "_enrich", blocked_enrich)
+    dropped_before = metrics["metadata_enrichment_dropped"]
+
+    schedule_metadata_enrichment("Example_Pkg", "first", is_json=False, ttl=60)
+    schedule_metadata_enrichment("example-pkg", "second", is_json=True, ttl=30)
+    await asyncio.sleep(0)
+
+    assert calls == ["example-pkg"]
+    assert len(_pending) == 1
+    assert metrics["metadata_enrichment_dropped"] == dropped_before
+
+    release.set()
+    await drain_metadata_tasks()
+    schedule_metadata_enrichment("example.pkg", "third", is_json=False, ttl=60)
+    await drain_metadata_tasks()
+
+    assert calls == ["example-pkg", "example-pkg"]
+
+
 def test_extraction_candidates_prefer_newest_valid_wheels(monkeypatch):
     monkeypatch.setattr(settings, "metadata_max_extract_files_per_project", 3)
     files = [
@@ -457,18 +529,20 @@ def test_extraction_candidates_prefer_newest_valid_wheels(monkeypatch):
         File(filename="demo-3.0-py3-none-any.whl", url="/new-a"),
         File(filename="demo-2.0-py3-none-any.whl", url="/middle"),
         File(filename="demo-3.0-py3-none-manylinux_2_17_x86_64.whl", url="/new-b"),
+        File(filename="demo-4.0-py3-none-any.whl", url="/present", core_metadata=True),
     ]
 
     assert _extraction_candidate_indexes(files) == {3, 4, 5}
 
 
-async def test_project_extraction_count_is_bounded_but_all_sidecars_are_probed(
+async def test_large_project_only_probes_bounded_candidates_and_publishes(
     client, mock_upstream, monkeypatch
 ):
     import app.metadata as meta
 
     monkeypatch.setattr(settings, "enable_background_metadata", True)
     monkeypatch.setattr(settings, "metadata_max_extract_files_per_project", 3)
+    upstream_metadata_hash = "f" * 64
     html = (
         "<!DOCTYPE html><html><body>"
         + "".join(
@@ -476,7 +550,12 @@ async def test_project_extraction_count_is_bounded_but_all_sidecars_are_probed(
                 f'<a href="https://files.pythonhosted.org/packages/demo-{version}.0-py3-none-any.whl'
                 f'#sha256={version:064x}">demo-{version}.0-py3-none-any.whl</a>'
             )
-            for version in range(35)
+            for version in range(1000)
+        )
+        + (
+            '<a href="https://files.pythonhosted.org/packages/demo-1001.0-py3-none-any.whl'
+            f'#sha256={1001:064x}" data-core-metadata="sha256={upstream_metadata_hash}">'
+            "demo-1001.0-py3-none-any.whl</a>"
         )
         + "</body></html>"
     )
@@ -497,10 +576,21 @@ async def test_project_extraction_count_is_bounded_but_all_sidecars_are_probed(
     assert response.status_code == 200
     await drain_metadata_tasks()
 
-    assert len([call for call in recorder.calls if call["method"] == "HEAD"]) == 35
+    assert len([call for call in recorder.calls if call["method"] == "HEAD"]) == 3
     assert len(extracted_urls) == 3
     assert {url.rsplit("/", 1)[-1] for url in extracted_urls} == {
-        "demo-32.0-py3-none-any.whl",
-        "demo-33.0-py3-none-any.whl",
-        "demo-34.0-py3-none-any.whl",
+        "demo-997.0-py3-none-any.whl",
+        "demo-998.0-py3-none-any.whl",
+        "demo-999.0-py3-none-any.whl",
+    }
+    enriched = await client.get(
+        "/simple/bounded/", headers={"Accept": "application/vnd.pypi.simple.v1+json"}
+    )
+    files_by_name = {file["filename"]: file for file in enriched.json()["files"]}
+    for version in (997, 998, 999):
+        assert isinstance(
+            files_by_name[f"demo-{version}.0-py3-none-any.whl"]["core-metadata"], dict
+        )
+    assert files_by_name["demo-1001.0-py3-none-any.whl"]["core-metadata"] == {
+        "sha256": upstream_metadata_hash
     }

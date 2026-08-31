@@ -85,13 +85,66 @@ async def test_range_ignored_does_not_read_full_response() -> None:
     stream = UnreadableBody()
 
     def ignore_range(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, stream=stream, request=request)
+        return httpx.Response(
+            200,
+            headers={"Content-Length": str(wheel_metadata._MAX_EOCD_SEARCH + 1)},
+            stream=stream,
+            request=request,
+        )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(ignore_range)) as client:
         with pytest.raises(RangeNotSupportedError, match="ignored"):
             await extract_wheel_metadata(client, "https://packages.test/huge.whl")
 
     assert stream.was_read is False
+
+
+async def test_extracts_small_wheel_when_origin_returns_full_response() -> None:
+    expected = b"Metadata-Version: 2.4\nName: example\nVersion: 1.0\n"
+    body = _wheel(expected)
+    requests: list[str] = []
+
+    def ignore_range(request: httpx.Request) -> httpx.Response:
+        requests.append(request.headers["Range"])
+        return httpx.Response(200, content=body, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(ignore_range)) as client:
+        result = await extract_wheel_metadata(
+            client, "https://packages.test/example-1.0-py3-none-any.whl"
+        )
+
+    assert result == expected
+    assert requests == [f"bytes=-{wheel_metadata._MAX_EOCD_SEARCH}"]
+
+
+class OversizedBody(httpx.AsyncByteStream):
+    def __init__(self, limit: int) -> None:
+        self.chunks = [b"x" * limit, b"y", b"must not be read"]
+        self.yielded = 0
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            self.yielded += 1
+            yield chunk
+
+    async def aclose(self) -> None:
+        pass
+
+
+async def test_range_ignored_without_length_stops_after_bounded_probe() -> None:
+    limit = wheel_metadata._MAX_EOCD_SEARCH
+    stream = OversizedBody(limit)
+
+    def ignore_range(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=stream, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(ignore_range)) as client:
+        with pytest.raises(RangeNotSupportedError, match="safe limit"):
+            await extract_wheel_metadata(
+                client, "https://packages.test/example-1.0-py3-none-any.whl"
+            )
+
+    assert stream.yielded == 2
 
 
 async def test_redirect_is_not_followed_or_read() -> None:

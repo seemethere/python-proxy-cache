@@ -46,8 +46,9 @@ and serves it from `wheel-url.metadata`. Set `METADATA_ARTIFACT_BASE_URL` to the
 `METADATA_HEAD_CONCURRENCY` (default 10) and `METADATA_MAX_INFLIGHT_PROJECTS` (default 4)
 bound active work; `METADATA_MAX_PENDING_PROJECTS` (default 16) bounds all scheduled project
 enrichments, including queued work. `METADATA_EXTRACT_CONCURRENCY` (default 2) separately bounds
-ZIP extraction, and `METADATA_MAX_EXTRACT_FILES_PER_PROJECT` (default 32) limits each project
-pass to its newest parseable wheel files. Generated metadata is retained for
+ZIP extraction. To keep large project indexes bounded, only the newest
+`METADATA_MAX_EXTRACT_FILES_PER_PROJECT` (default 32) parseable wheels missing metadata are
+probed during each project pass. Generated metadata is retained for
 `METADATA_CACHE_TTL_SECONDS` (default one year), while failures are retried after
 `METADATA_FAILURE_TTL_SECONDS` (default one hour).
 `ARTIFACT_HOST_SCHEME` (default `https`) is the scheme used to reach extra allowlisted hosts.

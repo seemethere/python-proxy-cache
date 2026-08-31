@@ -41,8 +41,12 @@ class RangeNotSupportedError(WheelMetadataError):
 
 
 async def _range_response(
-    client: httpx.AsyncClient, url: str, range_value: str
-) -> tuple[bytes, int, int, int]:
+    client: httpx.AsyncClient,
+    url: str,
+    range_value: str,
+    *,
+    allow_full_response_up_to: int | None = None,
+) -> tuple[bytes, int, int, int, bool]:
     request = client.build_request(
         "GET",
         url,
@@ -50,16 +54,44 @@ async def _range_response(
     )
     response = await client.send(request, stream=True, follow_redirects=False)
     try:
-        # Check this before reading.  In particular, a 200 may be the entire
-        # multi-gigabyte wheel from an origin which ignores Range.
-        if response.status_code != 206:
-            if response.status_code == 200:
-                raise RangeNotSupportedError("server ignored the Range request")
-            raise WheelMetadataError(f"range request returned HTTP {response.status_code}")
-
         content_encoding = response.headers.get("Content-Encoding", "identity").lower()
         if content_encoding not in ("", "identity"):
             raise WheelMetadataError("range response used content encoding")
+
+        if response.status_code == 200:
+            if allow_full_response_up_to is None:
+                raise RangeNotSupportedError("server ignored the Range request")
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None:
+                try:
+                    declared_length = int(content_length)
+                except ValueError as exc:
+                    raise WheelMetadataError("invalid Content-Length") from exc
+                if declared_length > allow_full_response_up_to:
+                    raise RangeNotSupportedError(
+                        "server ignored the Range request and response exceeds safe limit"
+                    )
+
+            # Some origins return the complete object when a suffix range is
+            # larger than the object. Read no more than the permitted body plus
+            # one byte, so a missing or dishonest Content-Length stays bounded.
+            chunks: list[bytes] = []
+            received = 0
+            async for chunk in response.aiter_bytes(chunk_size=allow_full_response_up_to + 1):
+                received += len(chunk)
+                if received > allow_full_response_up_to:
+                    raise RangeNotSupportedError(
+                        "server ignored the Range request and response exceeds safe limit"
+                    )
+                chunks.append(chunk)
+            if content_length is not None and received != declared_length:
+                raise WheelMetadataError("Content-Length does not match response body")
+            if received <= 0 or received > MAX_ARCHIVE_SIZE:
+                raise WheelMetadataError("invalid archive size")
+            return b"".join(chunks), 0, received - 1, received, True
+
+        if response.status_code != 206:
+            raise WheelMetadataError(f"range request returned HTTP {response.status_code}")
 
         raw_content_range = response.headers.get("Content-Range", "")
         match = _CONTENT_RANGE_RE.fullmatch(raw_content_range.strip())
@@ -87,17 +119,24 @@ async def _range_response(
             chunks.append(chunk)
         if received != expected_length:
             raise WheelMetadataError("truncated range response")
-        return b"".join(chunks), start, end, total
+        return b"".join(chunks), start, end, total, False
     finally:
         await response.aclose()
 
 
-async def _fetch_suffix(client: httpx.AsyncClient, url: str, length: int) -> tuple[bytes, int]:
-    data, start, end, total = await _range_response(client, url, f"bytes=-{length}")
+async def _fetch_suffix(
+    client: httpx.AsyncClient, url: str, length: int
+) -> tuple[bytes, int, bool]:
+    data, start, end, total, is_full_response = await _range_response(
+        client,
+        url,
+        f"bytes=-{length}",
+        allow_full_response_up_to=length,
+    )
     expected_start = max(0, total - length)
     if start != expected_start or end != total - 1:
         raise WheelMetadataError("server returned the wrong suffix range")
-    return data, total
+    return data, total, is_full_response
 
 
 async def _fetch_exact(
@@ -106,7 +145,7 @@ async def _fetch_exact(
     if length <= 0 or start < 0 or start + length > archive_size:
         raise WheelMetadataError("invalid ZIP byte range")
     end = start + length - 1
-    data, actual_start, actual_end, total = await _range_response(
+    data, actual_start, actual_end, total, _ = await _range_response(
         client, url, f"bytes={start}-{end}"
     )
     if total != archive_size or actual_start != start or actual_end != end:
@@ -280,11 +319,20 @@ def _decompress_metadata(data: bytes, method: int, expected_size: int) -> bytes:
 async def extract_wheel_metadata(client: httpx.AsyncClient, url: str) -> bytes:
     """Return the wheel's ``.dist-info/METADATA`` using bounded range reads."""
 
-    tail, archive_size = await _fetch_suffix(client, url, _MAX_EOCD_SEARCH)
+    tail, archive_size, is_full_response = await _fetch_suffix(client, url, _MAX_EOCD_SEARCH)
+    full_archive = tail if is_full_response else None
+
+    async def fetch_exact(start: int, length: int) -> bytes:
+        if full_archive is None:
+            return await _fetch_exact(client, url, start, length, archive_size)
+        if length <= 0 or start < 0 or start + length > archive_size:
+            raise WheelMetadataError("invalid ZIP byte range")
+        return full_archive[start : start + length]
+
     central_offset, central_size, entry_count = _parse_eocd(
         tail, archive_size - len(tail), archive_size
     )
-    central = await _fetch_exact(client, url, central_offset, central_size, archive_size)
+    central = await fetch_exact(central_offset, central_size)
     (
         member_name,
         flags,
@@ -302,7 +350,7 @@ async def extract_wheel_metadata(client: httpx.AsyncClient, url: str) -> bytes:
     if compressed_size == 0:
         raise WheelMetadataError("empty wheel metadata")
 
-    local_header = await _fetch_exact(client, url, local_offset, 30, archive_size)
+    local_header = await fetch_exact(local_offset, 30)
     if local_header[:4] != _LOCAL_SIGNATURE:
         raise WheelMetadataError("invalid local file header")
     local_flags, local_method = struct.unpack_from("<HH", local_header, 6)
@@ -311,9 +359,7 @@ async def extract_wheel_metadata(client: httpx.AsyncClient, url: str) -> bytes:
         raise WheelMetadataError("local and central ZIP headers disagree")
     if local_flags & 0x41:
         raise WheelMetadataError("encrypted ZIP members are unsupported")
-    variable = await _fetch_exact(
-        client, url, local_offset + 30, name_length + extra_length, archive_size
-    )
+    variable = await fetch_exact(local_offset + 30, name_length + extra_length)
     raw_local_name = variable[:name_length]
     if _decode_name(raw_local_name, local_flags) != member_name:
         raise WheelMetadataError("local and central member names disagree")
@@ -321,7 +367,7 @@ async def extract_wheel_metadata(client: httpx.AsyncClient, url: str) -> bytes:
         raise WheelMetadataError("ZIP64 archives are unsupported")
 
     data_offset = local_offset + 30 + name_length + extra_length
-    compressed = await _fetch_exact(client, url, data_offset, compressed_size, archive_size)
+    compressed = await fetch_exact(data_offset, compressed_size)
     result = _decompress_metadata(compressed, method, uncompressed_size)
     if binascii.crc32(result) & 0xFFFFFFFF != expected_crc:
         raise WheelMetadataError("metadata CRC mismatch")
