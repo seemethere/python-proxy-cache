@@ -16,6 +16,8 @@ services:
       CACHE_BACKEND: "redis"
       CACHE_TTL_SECONDS: "300"
       ENABLE_BACKGROUND_METADATA: "${ENABLE_BACKGROUND_METADATA:-false}"
+      # Extract through nginx so range reads populate/share the artifact cache.
+      METADATA_ARTIFACT_BASE_URL: "http://nginx"
     depends_on: [redis]
     healthcheck:
       test: ["CMD", "python", "-c", "import httpx; print(httpx.get('http://localhost:8000/health', timeout=2).text)"]

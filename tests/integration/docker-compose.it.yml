@@ -25,6 +25,7 @@ services:
       REDIS_URL: "redis://redis:6379/0"
       CACHE_BACKEND: "redis"
       ENABLE_BACKGROUND_METADATA: "true"
+      METADATA_ARTIFACT_BASE_URL: "http://nginx"
     depends_on: [redis, fake-upstream]
 
   nginx:

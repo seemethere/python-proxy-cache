@@ -62,13 +62,39 @@ has "requires-python kept"  "$HT" 'data-requires-python'
 has "url rewritten"         "$HT" '/artifacts/fake-files:9100/packages/'
 
 echo
+echo "=== generated wheel metadata routes to Python ==="
+META_URL="$BASE/artifacts/fake-files:9100/packages/legacy-1.0-py3-none-any.whl.metadata"
+for i in $(seq 1 20); do
+  META_STATUS=$(curl -s -o /tmp/ppcit-metadata -w '%{http_code}' "$META_URL")
+  [ "$META_STATUS" = "200" ] && break
+  # Extraction is deliberately asynchronous and bounded.
+  curl -s -H 'Accept: text/html' "$BASE/simple/legacy/" >/dev/null
+  sleep 1
+done
+check "generated metadata status" "$META_STATUS" "200"
+has "generated metadata body" "$(cat /tmp/ppcit-metadata)" "Name: demo"
+META_HEADERS=$(curl -s -D- -o /dev/null "$META_URL" | tr -d '\r')
+has "metadata served by Python" "$META_HEADERS" "x-content-type-options: nosniff"
+
+META_BAD=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/artifacts/evil.example/demo.whl.metadata")
+check "metadata allowlist enforced" "$META_BAD" "403"
+
+UPSTREAM_META_URL="$BASE/artifacts/fake-files:9100/packages/demo-1.0-py3-none-any.whl.metadata"
+UPSTREAM_META=$(curl -s "$UPSTREAM_META_URL")
+has "existing upstream metadata fallback" "$UPSTREAM_META" "Name: demo"
+curl -s -o /dev/null "$UPSTREAM_META_URL"
+UPSTREAM_META_CACHE=$(curl -s -D- -o /dev/null "$UPSTREAM_META_URL" | tr -d '\r' | awk -F': ' '/[Xx]-[Nn]ginx-[Cc]ache/{print $2}')
+check "upstream metadata cache HIT" "$UPSTREAM_META_CACHE" "HIT"
+
+echo
 echo "=== artifact fetch through nginx (THE resolver fix) ==="
 A=$(curl -s -o /tmp/ppcit-whl -w '%{http_code}' "$BASE/artifacts/fake-files:9100/packages/demo-1.0-py3-none-any.whl")
 check "artifact 200" "$A" "200"
 SIZE=$(wc -c </tmp/ppcit-whl | tr -d ' ')
-WANT=$(python3 -c 'import re,sys; src=open("upstream.py").read(); print(len(eval(re.search(r"WHEEL_BYTES = (.+)", src).group(1))))')
+WANT=$(python3 -c 'import upstream; print(len(upstream.WHEEL_BYTES))')
 check "artifact bytes intact" "$SIZE" "$WANT"
-has "payload correct" "$(head -c 24 /tmp/ppcit-whl)" "fake wheel payload"
+PAYLOAD=$(python3 -c 'import zipfile; print(zipfile.ZipFile("/tmp/ppcit-whl").read("demo/__init__.py").decode())')
+has "payload correct" "$PAYLOAD" "fake wheel payload"
 
 echo "=== artifact is cached by nginx ==="
 curl -s -o /dev/null "$BASE/artifacts/fake-files:9100/packages/demo-1.0-py3-none-any.whl"

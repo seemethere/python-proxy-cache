@@ -38,11 +38,22 @@ Or use the compose profile:
 UPSTREAM_SIMPLE_URL=http://legacy-simple:9000/simple docker compose --profile legacy up -d
 ```
 
-`ENABLE_BACKGROUND_METADATA=true` enables lazy `HEAD …metadata` probes after a miss
-(off by default; adds upstream load). Probes only ever target allowlisted artifact hosts.
+`ENABLE_BACKGROUND_METADATA=true` enables lazy metadata enrichment after a project miss
+(off by default). The proxy first probes `HEAD …metadata`; when an allowlisted wheel has no
+upstream metadata, it uses bounded range reads to extract `METADATA`, stores it by wheel SHA256,
+and serves it from `wheel-url.metadata`. Set `METADATA_ARTIFACT_BASE_URL` to the nginx base URL
+(for example, `http://nginx`) so those range reads share its artifact cache.
 `METADATA_HEAD_CONCURRENCY` (default 10) and `METADATA_MAX_INFLIGHT_PROJECTS` (default 4)
-are global caps, not per-project. `ARTIFACT_HOST_SCHEME` (default `https`) is the scheme used
-to reach extra allowlisted hosts.
+bound active work; `METADATA_MAX_PENDING_PROJECTS` (default 16) bounds all scheduled project
+enrichments, including queued work. `METADATA_EXTRACT_CONCURRENCY` (default 2) separately bounds
+ZIP extraction, and `METADATA_MAX_EXTRACT_FILES_PER_PROJECT` (default 32) limits each project
+pass to its newest parseable wheel files. Generated metadata is retained for
+`METADATA_CACHE_TTL_SECONDS` (default one year), while failures are retried after
+`METADATA_FAILURE_TTL_SECONDS` (default one hour).
+`ARTIFACT_HOST_SCHEME` (default `https`) is the scheme used to reach extra allowlisted hosts.
+While enrichment is enabled, project responses carry `Cache-Control: no-store` so an outer
+proxy cannot hide a newly enriched response behind its earlier unannotated copy; Redis remains
+the project-response cache.
 
 ## Perf
 
