@@ -89,9 +89,7 @@ class Cache:
                 await asyncio.sleep(self.startup_retry_delay_seconds)
 
         if self.backend == "redis_required":
-            raise RuntimeError(
-                f"redis required but connect/ping failed after {attempts} attempts"
-            )
+            raise RuntimeError(f"redis required but connect/ping failed after {attempts} attempts")
 
     async def reconnect(self) -> bool:
         """(Re)build Redis client and ping. Used after degrade or at startup.
