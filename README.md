@@ -65,8 +65,14 @@ the project-response cache.
 
 See [bench/README.md](bench/README.md). TL;DR:
 
-- `X-Cache: HIT` should be 1-5ms (python) / <5ms (nginx)
-- `MISS+s nthesis` = upstream RTT + 5-15ms parse overhead
+- `X-Cache` reports the Python project cache (Redis or memory).
+- `X-Nginx-Cache` reports nginx response caching, including artifact slices.
+- Do not combine Simple and artifact nginx statuses into one hit rate. With background
+  metadata enrichment enabled, Simple responses are intentionally `no-store` at nginx
+  while their Python project-cache result is still reported by `X-Cache`.
+- `MISS+synthesis` = upstream RTT + 5-15ms parse overhead
 - Use `bench/bench.py --compare` to measure degradation vs direct upstream, and `locust` to simulate 1000s runners.
 
-Metrics: `GET /metrics` + `X-Cache`, `X-Upstream-Time`, `Server-Timing` headers.
+Metrics: `GET /metrics` contains Python project-cache counters. Use `X-Nginx-Cache` for
+nginx artifact-cache outcomes; the Python process cannot observe nginx's final cache status.
+`X-Upstream-Time` and `Server-Timing` expose upstream and synthesis timing.

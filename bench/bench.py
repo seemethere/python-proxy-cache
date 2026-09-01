@@ -15,6 +15,8 @@ import asyncio
 import json
 import statistics
 import time
+from collections import Counter
+from urllib.parse import urlparse
 
 import httpx
 from rich.console import Console
@@ -23,21 +25,66 @@ from rich.table import Table
 console = Console()
 
 
-async def fetch(client, url, accept):
+async def fetch(client, url, accept, range_header=None):
     t0 = time.perf_counter()
-    r = await client.get(url, headers={"Accept": accept})
+    headers = {"Accept": accept}
+    if range_header:
+        headers["Range"] = range_header
+    r = await client.get(url, headers=headers)
     dt = (time.perf_counter() - t0) * 1000
     return (
         r.status_code,
         dt,
         r.headers.get("X-Cache", "-"),
+        r.headers.get("X-Nginx-Cache", "-"),
         r.headers.get("X-Synthesis", "-"),
         r.headers.get("X-Upstream-Time", "-"),
     )
 
 
-async def run_load(base: str, project: str, accept: str, concurrency: int, total: int):
-    url = f"{base.rstrip('/')}/simple/{project}/"
+def cache_summary(url: str, samples: list[tuple[int, str, str]]) -> dict:
+    """Summarize only the cache layer responsible for the requested path."""
+    path = urlparse(url).path
+    python_statuses = Counter()
+    nginx_statuses = Counter()
+
+    for status_code, python_cache, nginx_cache in samples:
+        if status_code >= 400:
+            continue
+        if path.startswith("/simple/") and python_cache not in {"", "-"}:
+            python_statuses[python_cache] += 1
+        elif path.startswith(("/artifacts/", "/packages/", "/files/")) and nginx_cache not in {
+            "",
+            "-",
+        }:
+            nginx_statuses[nginx_cache] += 1
+
+    def summarize(statuses: Counter, hit_states: set[str]) -> dict:
+        lookups = sum(statuses.values())
+        hits = sum(statuses[state] for state in hit_states)
+        return {
+            "hits": hits,
+            "lookups": lookups,
+            "hit_rate": hits / lookups if lookups else None,
+            "statuses": dict(sorted(statuses.items())),
+        }
+
+    return {
+        "python_project_cache": summarize(python_statuses, {"HIT", "HIT-synthesized"}),
+        "nginx_artifact_cache": summarize(nginx_statuses, {"HIT"}),
+    }
+
+
+async def run_load(
+    base: str,
+    project: str,
+    accept: str,
+    concurrency: int,
+    total: int,
+    url: str | None = None,
+    range_header: str | None = None,
+):
+    url = url or f"{base.rstrip('/')}/simple/{project}/"
     limits = httpx.Limits(max_connections=concurrency * 2, max_keepalive_connections=concurrency)
     async with httpx.AsyncClient(limits=limits, timeout=10) as client:
         sem = asyncio.Semaphore(concurrency)
@@ -46,13 +93,15 @@ async def run_load(base: str, project: str, accept: str, concurrency: int, total
 
         async def one():
             async with sem:
-                sc, dt, cache, _synth, _up = await fetch(client, url, accept)
+                sc, dt, python_cache, nginx_cache, _synth, _up = await fetch(
+                    client, url, accept, range_header
+                )
                 latencies.append(dt)
-                statuses.append((sc, cache))
+                statuses.append((sc, python_cache, nginx_cache))
                 return dt
 
         # warmup 1
-        await fetch(client, url, accept)
+        await fetch(client, url, accept, range_header)
         await asyncio.sleep(0.2)
         t0 = time.perf_counter()
         await asyncio.gather(*[one() for _ in range(total)])
@@ -62,6 +111,7 @@ async def run_load(base: str, project: str, accept: str, concurrency: int, total
         def pct(p):
             return latencies[int(len(latencies) * p / 100)] if latencies else 0
 
+        cache = cache_summary(url, statuses)
         return {
             "url": url,
             "accept": accept,
@@ -75,8 +125,10 @@ async def run_load(base: str, project: str, accept: str, concurrency: int, total
             "min": min(latencies) if latencies else 0,
             "max": max(latencies) if latencies else 0,
             "mean": statistics.mean(latencies) if latencies else 0,
-            "errors": sum(1 for s, _ in statuses if s != 200),
-            "hits": sum(1 for _, c in statuses if "HIT" in c),
+            "errors": sum(1 for s, _, _ in statuses if s not in {200, 206}),
+            # Backward-compatible alias for callers of the original Simple-only benchmark.
+            "hits": cache["python_project_cache"]["hits"],
+            "cache": cache,
         }
 
 
@@ -111,7 +163,7 @@ async def compare(base: str, upstream: str, project: str):
             r = await c.get(url, headers={"Accept": accept})
             dt = (time.perf_counter() - t0) * 1000
             console.print(
-                f"[bold]{label}[/]: {r.status_code} {dt:.1f}ms X-Cache:{r.headers.get('X-Cache', '-')} X-Synthesis:{r.headers.get('X-Synthesis', '-')} X-Upstream-Time:{r.headers.get('X-Upstream-Time', '-')} CT:{r.headers.get('content-type', '')[:40]} len:{len(r.content)}"
+                f"[bold]{label}[/]: {r.status_code} {dt:.1f}ms X-Cache:{r.headers.get('X-Cache', '-')} X-Nginx-Cache:{r.headers.get('X-Nginx-Cache', '-')} X-Synthesis:{r.headers.get('X-Synthesis', '-')} X-Upstream-Time:{r.headers.get('X-Upstream-Time', '-')} CT:{r.headers.get('content-type', '')[:40]} len:{len(r.content)}"
             )
         console.print(
             "\n[dim]If upstream already has JSON+core-metadata: MISS should show X-Synthesis:0 and X-Upstream-Content-Type: ...json, and total ≈ upstream + <5ms.[/]"
@@ -128,6 +180,8 @@ def main():
     p.add_argument("--project", default="requests")
     p.add_argument("--concurrency", type=int, default=50)
     p.add_argument("--requests", type=int, default=500)
+    p.add_argument("--url", help="full Simple or artifact URL (overrides --base/--project)")
+    p.add_argument("--range", dest="range_header", help='optional Range header, e.g. "bytes=0-0"')
     p.add_argument(
         "--accept", default="application/vnd.pypi.simple.v1+json", help="Accept header to bench"
     )
@@ -141,21 +195,34 @@ def main():
         return
 
     res = asyncio.run(
-        run_load(args.base, args.project, args.accept, args.concurrency, args.requests)
+        run_load(
+            args.base,
+            args.project,
+            args.accept,
+            args.concurrency,
+            args.requests,
+            args.url,
+            args.range_header,
+        )
     )
     t = Table(
         title=f"Bench {res['url']} Accept:{res['accept'][:30]} c={res['concurrency']} n={res['total']}"
     )
     t.add_column("metric")
     t.add_column("value")
-    for k in ["rps", "mean", "p50", "p95", "p99", "min", "max", "elapsed", "hits", "errors"]:
+    for k in ["rps", "mean", "p50", "p95", "p99", "min", "max", "elapsed", "errors"]:
         v = res[k]
         t.add_row(k, f"{v:.1f}" if isinstance(v, float) else str(v))
+    for layer, summary in res["cache"].items():
+        if summary["lookups"]:
+            t.add_row(f"{layer}_hits", f"{summary['hits']}/{summary['lookups']}")
+            t.add_row(f"{layer}_hit_rate", f"{summary['hit_rate']:.1%}")
+            t.add_row(f"{layer}_statuses", json.dumps(summary["statuses"], sort_keys=True))
     console.print(t)
     # degradation check
     if res["p95"] > 100:
         console.print(
-            "[yellow]p95 >100ms - check cache hit rate (should be ~1-5ms for HIT, 30-80ms for MISS+s nthesis)[/]"
+            "[yellow]p95 >100ms - check the applicable cache layer (Python/Redis for Simple; nginx for artifacts)[/]"
         )
     else:
         console.print("[green]p95 OK for cache HIT path[/]")
