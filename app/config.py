@@ -2,6 +2,7 @@ from functools import lru_cache
 from typing import Literal
 from urllib.parse import urlparse
 
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 CacheBackend = Literal["memory", "redis", "redis_required"]
@@ -15,6 +16,8 @@ class Settings(BaseSettings):
     artifact_host_allowlist: str = ""
     redis_url: str = "redis://redis:6379/0"
     cache_backend: CacheBackend = "redis"
+    redis_startup_max_attempts: int = Field(default=30, ge=1)
+    redis_startup_retry_delay_seconds: float = Field(default=1.0, ge=0)
     cache_ttl_seconds: int = 300  # used for /simple/ index
     cache_project_ttl_seconds: int = (
         60  # shorter TTL for /simple/{project}/ — limits stale window after publish

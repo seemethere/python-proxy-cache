@@ -134,6 +134,79 @@ async def test_connect_ping_success():
 
 
 @pytest.mark.asyncio
+async def test_required_redis_retries_startup_until_connected(monkeypatch):
+    c = Cache(backend="redis_required")
+    c.startup_max_attempts = 3
+    c.startup_retry_delay_seconds = 0.25
+    outcomes = iter([False, False, True])
+    sleeps: list[float] = []
+
+    async def reconnect():
+        return next(outcomes)
+
+    async def sleep(delay: float):
+        sleeps.append(delay)
+
+    c.reconnect = reconnect  # ty: ignore[invalid-assignment]
+    monkeypatch.setattr("app.cache.asyncio.sleep", sleep)
+
+    await c.connect()
+
+    assert sleeps == [0.25, 0.25]
+
+
+@pytest.mark.asyncio
+async def test_required_redis_startup_retries_are_bounded(monkeypatch):
+    c = Cache(backend="redis_required")
+    c.startup_max_attempts = 3
+    c.startup_retry_delay_seconds = 0.25
+    reconnects = 0
+    sleeps: list[float] = []
+
+    async def reconnect():
+        nonlocal reconnects
+        reconnects += 1
+        return False
+
+    async def sleep(delay: float):
+        sleeps.append(delay)
+
+    c.reconnect = reconnect  # ty: ignore[invalid-assignment]
+    monkeypatch.setattr("app.cache.asyncio.sleep", sleep)
+
+    with pytest.raises(
+        RuntimeError, match="redis required but connect/ping failed after 3 attempts"
+    ):
+        await c.connect()
+
+    assert reconnects == 3
+    assert sleeps == [0.25, 0.25]
+
+
+@pytest.mark.asyncio
+async def test_optional_redis_does_not_retry_startup(monkeypatch):
+    c = Cache(backend="redis")
+    c.startup_max_attempts = 3
+    c.startup_retry_delay_seconds = 0.25
+    reconnects = 0
+
+    async def reconnect():
+        nonlocal reconnects
+        reconnects += 1
+        return False
+
+    async def unexpected_sleep(_delay: float):
+        pytest.fail("optional Redis startup should not sleep")
+
+    c.reconnect = reconnect  # ty: ignore[invalid-assignment]
+    monkeypatch.setattr("app.cache.asyncio.sleep", unexpected_sleep)
+
+    await c.connect()
+
+    assert reconnects == 1
+
+
+@pytest.mark.asyncio
 async def test_reconnect_after_degrade():
     c = Cache(backend="redis")
     c._redis = None

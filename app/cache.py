@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from enum import StrEnum
@@ -36,6 +37,8 @@ class Cache:
         self._mem: dict[str, tuple[float, str]] = {}
         self.url = redis_url or settings.redis_url
         self.backend: CacheBackendName = backend or settings.cache_backend
+        self.startup_max_attempts = settings.redis_startup_max_attempts
+        self.startup_retry_delay_seconds = settings.redis_startup_retry_delay_seconds
         self.state = CacheState.MEMORY
         # Request-path failures only. Health probes bump redis_probe_errors so a
         # polled /health during an outage cannot inflate the request-path metric.
@@ -71,8 +74,22 @@ class Cache:
         if self.backend == "memory":
             self.state = CacheState.MEMORY
             return
-        if not await self.reconnect() and self.backend == "redis_required":
-            raise RuntimeError("redis required but connect/ping failed")
+
+        attempts = self.startup_max_attempts if self.backend == "redis_required" else 1
+        for attempt in range(1, attempts + 1):
+            if await self.reconnect():
+                return
+            if attempt < attempts:
+                logger.info(
+                    "redis required at startup; retrying in %s seconds (%d/%d)",
+                    self.startup_retry_delay_seconds,
+                    attempt + 1,
+                    attempts,
+                )
+                await asyncio.sleep(self.startup_retry_delay_seconds)
+
+        if self.backend == "redis_required":
+            raise RuntimeError(f"redis required but connect/ping failed after {attempts} attempts")
 
     async def reconnect(self) -> bool:
         """(Re)build Redis client and ping. Used after degrade or at startup.
