@@ -18,6 +18,11 @@ pproxy-bench --base http://localhost:8000 --compare --project requests
 pproxy-bench --base http://localhost:8000 --concurrency 50 --requests 1000 --project requests
 pproxy-bench --base http://localhost:8080 --concurrency 200 --requests 5000 --project urllib3  # via nginx
 
+# Artifact cache: report X-Nginx-Cache independently. Range avoids downloading
+# an entire large artifact for each sample.
+pproxy-bench --url http://localhost:8080/artifacts/files.pythonhosted.org/path/to/package.whl \
+  --range bytes=0-0 --requests 20
+
 # 4. compare nginx vs direct python (artifacts benefit from nginx)
 pproxy-bench --base http://localhost:8000 --concurrency 100 --requests 1000 --accept "text/html"
 pproxy-bench --base http://localhost:8080 --concurrency 100 --requests 1000 --accept "text/html"
@@ -33,8 +38,10 @@ locust -f bench/locustfile.py --host http://localhost:8080 --users 1000 --spawn-
 
 ## What to watch
 
-- `X-Cache: HIT` vs `MISS` vs `HIT-synthesized` + `Server-Timing` headers
-- `/metrics` -> `proxy_cache_hits` ratio should be >95% after warmup
+- Python project cache: `X-Cache` and `/metrics` (`proxy_cache_hits`/`proxy_cache_misses`)
+- nginx artifact cache: `X-Nginx-Cache` on `/artifacts/`, `/packages/`, and `/files/`
+- Keep these rates separate. In particular, background metadata enrichment makes
+  `/simple/` responses intentionally `no-store` at nginx while Redis still caches them.
 - `p95` for HIT should be <10ms via python direct, <5ms via nginx
-- `p95` for MISS+s nthesis should be `upstream p95 + 5-15ms` (not 2x)
+- `p95` for MISS+synthesis should be `upstream p95 + 5-15ms` (not 2x)
 - If `p95 HIT` degrades, increase `python-proxy` replicas or check `redis` latency

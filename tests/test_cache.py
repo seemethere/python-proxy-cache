@@ -233,6 +233,8 @@ async def test_health_includes_cache_fields(client):
     assert data["cache_state"] == "memory"
     assert data["redis"] is False
     body = (await client.get("/metrics")).text
+    assert "# HELP proxy_cache_hits Python project-cache hits" in body
+    assert "# HELP proxy_cache_misses Python project-cache misses" in body
     assert "proxy_cache_redis_errors_total" in body
     assert "proxy_cache_redis_probe_errors_total" in body
 

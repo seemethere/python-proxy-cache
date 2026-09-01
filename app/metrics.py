@@ -23,7 +23,9 @@ def prometheus_text() -> str:
     backend_code = _BACKEND_CODES.get(cache.state.value, -1)
     lines = [
         f"proxy_requests_total {metrics['requests_total']}",
+        "# HELP proxy_cache_hits Python project-cache hits served by memory or Redis.",
         f"proxy_cache_hits {metrics['cache_hits']}",
+        "# HELP proxy_cache_misses Python project-cache misses; this does not describe nginx artifact caching.",
         f"proxy_cache_misses {metrics['cache_misses']}",
         f"proxy_upstream_fetches {metrics['upstream_fetches']}",
         f"proxy_synthesis_count {metrics['synthesis_count']}",
