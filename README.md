@@ -31,6 +31,11 @@ Env vars: `UPSTREAM_SIMPLE_URL` (default `https://pypi.org/simple`), `UPSTREAM_F
 (default `https://files.pythonhosted.org`), `ARTIFACT_HOST_ALLOWLIST` (comma-separated extra
 hosts for `/artifacts/` rewrite; keep `nginx/nginx.conf` `map $artifact_host` in sync), `REDIS_URL`, `CACHE_BACKEND`, `CACHE_TTL_SECONDS`.
 
+With `CACHE_BACKEND=redis_required`, startup waits for Redis for a bounded number of attempts
+before exiting. `REDIS_STARTUP_MAX_ATTEMPTS` (default 30) sets the total number of connection
+attempts and `REDIS_STARTUP_RETRY_DELAY_SECONDS` (default 1) sets the delay between attempts.
+Optional Redis mode (`CACHE_BACKEND=redis`) still starts immediately in degraded in-memory mode.
+
 For legacy test: point `UPSTREAM_SIMPLE_URL` at a `pypiserver` that only returns HTML - JSON will be synthesized.
 Or use the compose profile:
 
