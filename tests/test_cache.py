@@ -237,6 +237,9 @@ async def test_health_includes_cache_fields(client):
     assert "# HELP proxy_cache_misses Python project-cache misses" in body
     assert "proxy_cache_redis_errors_total" in body
     assert "proxy_cache_redis_probe_errors_total" in body
+    assert "proxy_metadata_recovery_attempts_total" in body
+    assert "proxy_metadata_recovery_successes_total" in body
+    assert "proxy_metadata_recovery_failures_total" in body
 
 
 @pytest.mark.asyncio

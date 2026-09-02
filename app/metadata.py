@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import re
+from dataclasses import dataclass
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
@@ -34,7 +35,9 @@ _HEAD_TIMEOUT = 5.0
 # upstream HEAD would still let a large project open one cache operation per
 # file concurrently before any task reached the HEAD limit.
 _probe_semaphore = asyncio.Semaphore(settings.metadata_head_concurrency)
+_cache_semaphore = asyncio.Semaphore(settings.metadata_head_concurrency)
 _extract_semaphore = asyncio.Semaphore(settings.metadata_extract_concurrency)
+_recovery_extract_semaphore = asyncio.Semaphore(settings.metadata_recovery_concurrency)
 # Same reasoning for the tasks themselves — one enrichment per miss with no cap
 # lets a miss storm spawn unbounded background work with no back-pressure.
 _task_semaphore = asyncio.Semaphore(settings.metadata_max_inflight_projects)
@@ -113,60 +116,121 @@ def _metadata_blob_key(file_url: str, wheel_sha256: str) -> str:
     return f"metadata:url:{_artifact_url_digest(file_url)}:sha256:{wheel_sha256.lower()}"
 
 
+def _metadata_content_key(metadata_sha256: str) -> str:
+    return f"metadata:content:sha256:{metadata_sha256.lower()}"
+
+
 def _metadata_url_key(file_url: str) -> str:
     return f"metadata:url:{_artifact_url_digest(file_url)}:current"
+
+
+def _metadata_failure_key(file_url: str, wheel_sha256: str | None) -> str:
+    identity = f"metadata:failure:url:{_artifact_url_digest(file_url)}"
+    if wheel_sha256 is not None:
+        return f"{identity}:wheel-sha256:{wheel_sha256.lower()}"
+    return f"{identity}:recovery"
+
+
+def _metadata_fill_lock_key(file_url: str) -> str:
+    return f"metadata:url:{_artifact_url_digest(file_url)}:fill"
+
+
+async def _store_metadata_content(
+    file_url: str, content: bytes, *, wheel_sha256: str | None = None
+) -> tuple[str, str]:
+    text = content.decode("utf-8")
+    metadata_sha256 = hashlib.sha256(content).hexdigest()
+    record: dict[str, str | int] = {
+        "schema": 2,
+        "metadata-sha256": metadata_sha256,
+    }
+    if wheel_sha256 is not None:
+        wheel_sha256 = wheel_sha256.lower()
+        if not _SHA256_RE.fullmatch(wheel_sha256):
+            raise ValueError("wheel SHA256 must be 64 hexadecimal characters")
+        record["wheel-sha256"] = wheel_sha256
+
+    ttl = settings.metadata_cache_ttl_seconds
+    # Publish the URL record last: readers never observe a pointer before its
+    # content has been committed. Background writes with a known wheel hash
+    # also remain readable by older processes during a rolling upgrade.
+    await cache.setex(_metadata_content_key(metadata_sha256), ttl, text)
+    if wheel_sha256 is not None:
+        await cache.setex(_metadata_blob_key(file_url, wheel_sha256), ttl, text)
+    await cache.setex(
+        _metadata_url_key(file_url),
+        ttl,
+        json.dumps(record, separators=(",", ":")),
+    )
+    return text, metadata_sha256
 
 
 async def store_extracted_metadata(
     file_url: str, wheel_sha256: str, content: bytes
 ) -> dict[str, str]:
     """Persist extracted metadata by wheel digest and associate its artifact URL."""
-    wheel_sha256 = wheel_sha256.lower()
-    if not _SHA256_RE.fullmatch(wheel_sha256):
-        raise ValueError("wheel SHA256 must be 64 hexadecimal characters")
-    text = content.decode("utf-8")
-    metadata_sha256 = hashlib.sha256(content).hexdigest()
-    ttl = settings.metadata_cache_ttl_seconds
-    await cache.setex(_metadata_blob_key(file_url, wheel_sha256), ttl, text)
-    await cache.setex(
-        _metadata_url_key(file_url),
-        ttl,
-        json.dumps(
-            {"wheel-sha256": wheel_sha256, "metadata-sha256": metadata_sha256},
-            separators=(",", ":"),
-        ),
-    )
+    _, metadata_sha256 = await _store_metadata_content(file_url, content, wheel_sha256=wheel_sha256)
     return {"sha256": metadata_sha256}
 
 
-async def _associate_metadata_url(file_url: str, wheel_sha256: str, metadata_sha256: str) -> None:
-    await cache.setex(
-        _metadata_url_key(file_url),
-        settings.metadata_cache_ttl_seconds,
-        json.dumps(
-            {"wheel-sha256": wheel_sha256, "metadata-sha256": metadata_sha256},
-            separators=(",", ":"),
-        ),
-    )
+async def store_recovered_metadata(file_url: str, content: bytes) -> tuple[str, str]:
+    """Store request-time metadata when the wheel SHA fragment is unavailable."""
+    return await _store_metadata_content(file_url, content)
 
 
-async def load_metadata_for_url(file_url: str) -> tuple[str, str] | None:
+async def load_metadata_for_url(
+    file_url: str, *, expected_wheel_sha256: str | None = None
+) -> tuple[str, str] | None:
     """Resolve an artifact URL to (metadata text, metadata SHA256)."""
     raw_record = await cache.get(_metadata_url_key(file_url))
     if raw_record is None:
         return None
     try:
         record = json.loads(raw_record)
-        wheel_sha256 = record["wheel-sha256"]
         expected = record["metadata-sha256"]
-        if not _SHA256_RE.fullmatch(wheel_sha256) or not _SHA256_RE.fullmatch(expected):
+        if not isinstance(expected, str) or not _SHA256_RE.fullmatch(expected):
             return None
     except (TypeError, KeyError, ValueError, json.JSONDecodeError):
         return None
-    body = await cache.get(_metadata_blob_key(file_url, wheel_sha256))
+
+    if record.get("schema") == 2:
+        wheel_sha256 = record.get("wheel-sha256")
+        if wheel_sha256 is not None and (
+            not isinstance(wheel_sha256, str) or not _SHA256_RE.fullmatch(wheel_sha256)
+        ):
+            return None
+        if expected_wheel_sha256 is not None and wheel_sha256 != expected_wheel_sha256:
+            return None
+        body = await cache.get(_metadata_content_key(expected))
+        if body is None and isinstance(wheel_sha256, str):
+            body = await cache.get(_metadata_blob_key(file_url, wheel_sha256))
+    else:
+        wheel_sha256 = record.get("wheel-sha256")
+        if not isinstance(wheel_sha256, str) or not _SHA256_RE.fullmatch(wheel_sha256):
+            return None
+        if expected_wheel_sha256 is not None and wheel_sha256 != expected_wheel_sha256:
+            return None
+        body = await cache.get(_metadata_blob_key(file_url, wheel_sha256))
     if body is None or hashlib.sha256(body.encode()).hexdigest() != expected:
         return None
     return body, expected
+
+
+async def _load_metadata_bounded(
+    file_url: str, *, expected_wheel_sha256: str | None = None
+) -> tuple[str, str] | None:
+    async with _cache_semaphore:
+        return await load_metadata_for_url(
+            file_url,
+            expected_wheel_sha256=expected_wheel_sha256,
+        )
+
+
+@dataclass(frozen=True)
+class _MetadataResolution:
+    body: str | None = None
+    metadata_sha256: str | None = None
+    native: bool = False
 
 
 def _artifact_upstream_url(file_url: str) -> str | None:
@@ -197,6 +261,119 @@ async def _extract_wheel_metadata(url: str) -> bytes:
     from app.wheel_metadata import extract_wheel_metadata
 
     return await extract_wheel_metadata(get_http_client(), url)
+
+
+async def _resolve_metadata_for_url(
+    file_url: str,
+    *,
+    wheel_sha256: str | None,
+    allow_extraction: bool,
+    recovery: bool = False,
+) -> _MetadataResolution | None:
+    stored = await _load_metadata_bounded(
+        file_url,
+        expected_wheel_sha256=wheel_sha256,
+    )
+    if stored is not None:
+        return _MetadataResolution(body=stored[0], metadata_sha256=stored[1])
+
+    # Waiters take only the lightweight URL lock. Cache hits never queue behind
+    # network probes, and the probe permit is released before extraction.
+    async with miss_locks.hold(_metadata_fill_lock_key(file_url)):
+        stored = await _load_metadata_bounded(
+            file_url,
+            expected_wheel_sha256=wheel_sha256,
+        )
+        if stored is not None:
+            return _MetadataResolution(body=stored[0], metadata_sha256=stored[1])
+        if recovery:
+            metrics["metadata_recovery_attempts"] += 1
+
+        native_url = metadata_head_url(file_url)
+        if native_url is None:
+            if recovery:
+                metrics["metadata_recovery_failures"] += 1
+            return None
+        async with _probe_semaphore:
+            try:
+                response = await asyncio.wait_for(
+                    get_http_client().head(native_url, follow_redirects=False),
+                    timeout=_HEAD_TIMEOUT,
+                )
+            except Exception:
+                logger.debug(
+                    "metadata HEAD failed for %s",
+                    _safe_url_for_log(native_url),
+                    exc_info=True,
+                )
+                response = None
+        metrics["metadata_heads"] += 1
+        if response is not None and response.status_code == 200:
+            if recovery:
+                metrics["metadata_recovery_native_fallbacks"] += 1
+            return _MetadataResolution(native=True)
+        if not allow_extraction:
+            return None
+
+        failure_key = _metadata_failure_key(file_url, wheel_sha256)
+        if await cache.get(failure_key) is not None:
+            if recovery:
+                metrics["metadata_recovery_failures"] += 1
+            return None
+        artifact_url = _artifact_upstream_url(file_url)
+        if artifact_url is None:
+            if recovery:
+                metrics["metadata_recovery_failures"] += 1
+            return None
+        try:
+            extraction_limit = _recovery_extract_semaphore if recovery else _extract_semaphore
+            async with extraction_limit:
+                content = await _extract_wheel_metadata(artifact_url)
+            if wheel_sha256 is None:
+                body, metadata_sha256 = await store_recovered_metadata(file_url, content)
+            else:
+                advertised = await store_extracted_metadata(file_url, wheel_sha256, content)
+                body = content.decode("utf-8")
+                metadata_sha256 = advertised["sha256"]
+            metrics["metadata_extractions"] += 1
+            if recovery:
+                metrics["metadata_recovery_successes"] += 1
+            return _MetadataResolution(body=body, metadata_sha256=metadata_sha256)
+        except Exception as exc:
+            logger.info(
+                "metadata extraction failed for %s: %s",
+                _safe_url_for_log(artifact_url),
+                exc,
+            )
+            await cache.setex(
+                failure_key,
+                settings.metadata_failure_ttl_seconds,
+                "1",
+            )
+            metrics["metadata_extraction_failures"] += 1
+            if recovery:
+                metrics["metadata_recovery_failures"] += 1
+            return None
+
+
+async def load_or_recover_metadata_for_url(file_url: str) -> tuple[str, str] | None:
+    """Load generated metadata or safely reconstruct it after a cache-local miss."""
+    if not settings.enable_background_metadata:
+        return await _load_metadata_bounded(file_url)
+
+    resolved = await _resolve_metadata_for_url(
+        file_url,
+        wheel_sha256=None,
+        allow_extraction=True,
+        recovery=True,
+    )
+    if resolved is None:
+        return None
+    if resolved.native:
+        return None
+    if resolved.body is None or resolved.metadata_sha256 is None:
+        return None
+    return resolved.body, resolved.metadata_sha256
 
 
 def schedule_metadata_enrichment(canonical: str, body: str, *, is_json: bool, ttl: int) -> None:
@@ -237,73 +414,24 @@ def _needs_probe(f: File) -> bool:
 
 
 async def _probe(f: File, *, allow_extraction: bool = True) -> File:
-    async with _probe_semaphore:
-        return await _probe_with_permit(f, allow_extraction=allow_extraction)
-
-
-async def _probe_with_permit(f: File, *, allow_extraction: bool) -> File:
     if not _needs_probe(f):
         return f
     wheel_sha256 = f.hashes.get("sha256", "").lower()
     can_extract = f.filename.lower().endswith(".whl") and bool(_SHA256_RE.fullmatch(wheel_sha256))
-    if can_extract:
-        cached_body = await cache.get(_metadata_blob_key(f.url, wheel_sha256))
-        if cached_body is not None:
-            metadata_sha256 = hashlib.sha256(cached_body.encode()).hexdigest()
-            await _associate_metadata_url(f.url, wheel_sha256, metadata_sha256)
-            return _with_core_metadata(f, {"sha256": metadata_sha256})
-    url = metadata_head_url(f.url)
-    if url is None:
+    resolved = await _resolve_metadata_for_url(
+        f.url,
+        wheel_sha256=wheel_sha256 if can_extract else None,
+        allow_extraction=can_extract and allow_extraction,
+    )
+    if resolved is None:
         return f
-    try:
-        client = get_http_client()
-        r = await asyncio.wait_for(client.head(url), timeout=_HEAD_TIMEOUT)
-    except Exception:
-        logger.debug("metadata HEAD failed for %s", _safe_url_for_log(url), exc_info=True)
-        r = None
-    metrics["metadata_heads"] += 1
     core_metadata: bool | dict[str, str]
-    if r is not None and r.status_code == 200:
+    if resolved.native:
         core_metadata = True
+    elif resolved.metadata_sha256 is not None:
+        core_metadata = {"sha256": resolved.metadata_sha256}
     else:
-        if not can_extract or not allow_extraction:
-            return f
-        artifact_identity = f"{_artifact_url_digest(f.url)}:{wheel_sha256}"
-        failure_key = f"metadata:failure:{artifact_identity}"
-        if await cache.get(failure_key) is not None:
-            return f
-
-        async with miss_locks.hold(f"metadata:{artifact_identity}:fill"):
-            # A different project or replica-local task may have filled it while
-            # this probe waited. The process lock prevents duplicate range work
-            # within this worker; Redis exposes completed results to all replicas.
-            cached_body = await cache.get(_metadata_blob_key(f.url, wheel_sha256))
-            if cached_body is not None:
-                metadata_sha256 = hashlib.sha256(cached_body.encode()).hexdigest()
-                await _associate_metadata_url(f.url, wheel_sha256, metadata_sha256)
-                core_metadata = {"sha256": metadata_sha256}
-            else:
-                if await cache.get(failure_key) is not None:
-                    return f
-                artifact_url = _artifact_upstream_url(f.url)
-                if artifact_url is None:
-                    return f
-                try:
-                    async with _extract_semaphore:
-                        content = await _extract_wheel_metadata(artifact_url)
-                    core_metadata = await store_extracted_metadata(f.url, wheel_sha256, content)
-                    metrics["metadata_extractions"] += 1
-                except Exception as exc:
-                    # RangeNotSupportedError, malformed wheels, transport failures,
-                    # and invalid UTF-8 are all retryable after the short failure TTL.
-                    logger.info(
-                        "metadata extraction failed for %s: %s",
-                        _safe_url_for_log(artifact_url),
-                        exc,
-                    )
-                    await cache.setex(failure_key, settings.metadata_failure_ttl_seconds, "1")
-                    metrics["metadata_extraction_failures"] += 1
-                    return f
+        return f
     return _with_core_metadata(f, core_metadata)
 
 
