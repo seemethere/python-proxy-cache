@@ -76,6 +76,18 @@ has "generated metadata body" "$(cat /tmp/ppcit-metadata)" "Name: demo"
 META_HEADERS=$(curl -s -D- -o /dev/null "$META_URL" | tr -d '\r')
 has "metadata served by Python" "$META_HEADERS" "x-content-type-options: nosniff"
 
+# The initial project response is deliberately uncacheable while enrichment is
+# pending. Once the exact enriched body is ready, nginx may cache it safely.
+curl -s -D /tmp/ppcit-project-headers -o /tmp/ppcit-project \
+  -H 'Accept: text/html' "$BASE/simple/legacy/"
+has "completed project advertises metadata" "$(cat /tmp/ppcit-project)" \
+  'data-core-metadata="sha256='
+has "completed project is cacheable" "$(tr -d '\r' </tmp/ppcit-project-headers)" \
+  'cache-control: public, max-age='
+PROJECT_CACHE=$(curl -s -D- -o /dev/null -H 'Accept: text/html' \
+  "$BASE/simple/legacy/" | tr -d '\r' | awk -F': ' '/[Xx]-[Nn]ginx-[Cc]ache/{print $2}')
+check "completed project nginx cache HIT" "$PROJECT_CACHE" "HIT"
+
 # Simulate the metadata request landing on another process whose local cache
 # does not contain the object advertised by the project response. A unique
 # query also bypasses nginx's existing metadata entry without changing the

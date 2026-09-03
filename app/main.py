@@ -41,13 +41,21 @@ app.include_router(metadata_router)
 @app.middleware("http")
 async def metadata_enrichment_cache_control(request: Request, call_next):
     response = await call_next(request)
+    is_project = request.url.path.startswith("/simple/") and request.url.path != "/simple/"
+    if is_project:
+        vary = [
+            value.strip() for value in response.headers.get("vary", "").split(",") if value.strip()
+        ]
+        if "*" not in vary and not any(value.lower() == "accept" for value in vary):
+            vary.append("Accept")
+        response.headers["Vary"] = ", ".join(vary)
     # The first response can be returned before background extraction updates
     # Redis. Do not let an outer proxy retain that unenriched project page and
     # hide the completed result. The root project listing is not enriched.
     if (
         settings.enable_background_metadata
-        and request.url.path.startswith("/simple/")
-        and request.url.path != "/simple/"
+        and is_project
+        and "cache-control" not in response.headers
     ):
         response.headers["Cache-Control"] = "no-store"
     return response

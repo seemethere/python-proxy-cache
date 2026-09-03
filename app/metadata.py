@@ -12,16 +12,14 @@ from bs4 import BeautifulSoup
 from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel_filename
 from packaging.version import Version
 
-from app.artifacts import authority_of, host_allowed, rewrite_project_urls
+from app.artifacts import authority_of, host_allowed
 from app.cache import cache
 from app.config import settings
 from app.deps import get_http_client
 from app.metrics import metrics
-from app.models import File, Project
+from app.models import File
 from app.parse import (
     metadata_value_to_html,
-    model_to_html,
-    model_to_json,
     parse_simple_html,
     parse_simple_json,
 )
@@ -133,6 +131,42 @@ def _metadata_failure_key(file_url: str, wheel_sha256: str | None) -> str:
 
 def _metadata_fill_lock_key(file_url: str) -> str:
     return f"metadata:url:{_artifact_url_digest(file_url)}:fill"
+
+
+def _project_ready_key(canonical: str, *, is_json: bool) -> str:
+    output_format = "json" if is_json else "html"
+    return f"simple:{canonical}:{output_format}:metadata-ready"
+
+
+def _body_digest(body: str) -> str:
+    return hashlib.sha256(body.encode()).hexdigest()
+
+
+async def metadata_response_cache_ttl(canonical: str, body: str, *, is_json: bool) -> int | None:
+    """Return a cache TTL only when enrichment completed for this exact body."""
+    canonical = canonicalize_name(canonical)
+    marker_key = _project_ready_key(canonical, is_json=is_json)
+    output_format = "json" if is_json else "html"
+    return await cache.ttl_if_values(
+        marker_key,
+        _body_digest(body),
+        f"simple:{canonical}:{output_format}",
+        body,
+    )
+
+
+async def refresh_metadata_response_readiness(
+    canonical: str, body: str, *, is_json: bool, ttl: int
+) -> None:
+    """Extend a completed exact body's marker after successful revalidation."""
+    canonical = canonicalize_name(canonical)
+    marker_key = _project_ready_key(canonical, is_json=is_json)
+    digest = _body_digest(body)
+    body_key = f"simple:{canonical}:{'json' if is_json else 'html'}"
+    await cache.setex_many_if_unchanged(
+        {body_key: body, marker_key: digest},
+        [(marker_key, max(settings.cache_stale_ttl_seconds, ttl), digest)],
+    )
 
 
 async def _store_metadata_content(
@@ -513,9 +547,6 @@ async def _enrich(canonical: str, body: str, *, is_json: bool, ttl: int) -> None
                 not _needs_probe(nf) and _needs_probe(of)
                 for nf, of in zip(new_files, proj.files, strict=True)
             )
-            if not changed:
-                return
-
             stale = settings.cache_stale_ttl_seconds
             source_key = f"simple:{canonical}:{'json' if is_json else 'html'}"
 
@@ -526,25 +557,37 @@ async def _enrich(canonical: str, body: str, *, is_json: bool, ttl: int) -> None
                 if await cache.get(source_key) != body:
                     logger.debug("skipping stale enrichment for %s", canonical)
                     return
-                json_current = await cache.get(f"simple:{canonical}:json")
-                html_current = await cache.get(f"simple:{canonical}:html")
-                enriched = rewrite_project_urls(Project(name=proj.name, files=new_files))
-                json_body = (
-                    _advertise_metadata(json_current, is_json=True, files=new_files)
-                    if json_current is not None
-                    else json.dumps(model_to_json(enriched))
+                remaining_ttl = await cache.ttl(source_key)
+                if remaining_ttl is None:
+                    logger.debug("skipping expired enrichment for %s", canonical)
+                    return
+                completed_body = (
+                    _advertise_metadata(body, is_json=is_json, files=new_files) if changed else body
                 )
-                html_body = (
-                    _advertise_metadata(html_current, is_json=False, files=new_files)
-                    if html_current is not None
-                    else model_to_html(enriched)
+
+                # Commit only the representation that was actually probed, then
+                # publish its body-bound marker in the same compare-and-set. The
+                # opposite representation may belong to a concurrent upstream fill.
+                marker_ttl = max(stale, remaining_ttl)
+                writes: list[tuple[str, int, str]] = []
+                if changed:
+                    # Reuse the TTL the response was cached under; recomputing from the
+                    # default would extend an upstream max-age we already honoured.
+                    writes.extend(
+                        (
+                            (source_key, remaining_ttl, completed_body),
+                            (f"{source_key}:stale", stale, completed_body),
+                        )
+                    )
+                writes.append(
+                    (
+                        _project_ready_key(canonical, is_json=is_json),
+                        marker_ttl,
+                        _body_digest(completed_body),
+                    )
                 )
-                # Reuse the TTL the response was cached under; recomputing from the
-                # default would extend an upstream max-age we already honoured.
-                await cache.setex(f"simple:{canonical}:json", ttl, json_body)
-                await cache.setex(f"simple:{canonical}:json:stale", stale, json_body)
-                await cache.setex(f"simple:{canonical}:html", ttl, html_body)
-                await cache.setex(f"simple:{canonical}:html:stale", stale, html_body)
-            metrics["metadata_enrichments"] += 1
+                committed = await cache.setex_many_if_unchanged({source_key: body}, writes)
+                if committed and changed:
+                    metrics["metadata_enrichments"] += 1
     except Exception:
         logger.exception("background metadata enrichment failed for %s", canonical)

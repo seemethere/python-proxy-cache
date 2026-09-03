@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from enum import StrEnum
 from typing import Literal
@@ -174,6 +175,116 @@ class Cache:
             except Exception as e:
                 self._degrade(e)
         self._mem[key] = (time.time() + ttl, value)
+
+    async def ttl(self, key: str) -> int | None:
+        """Return the remaining whole-second lifetime for a live key."""
+        if self._redis is not None:
+            try:
+                remaining = int(await self._redis.ttl(key))
+                return remaining if remaining > 0 else None
+            except Exception as e:
+                self._degrade(e)
+        entry = self._mem.get(key)
+        if entry is None:
+            return None
+        remaining = entry[0] - time.time()
+        if remaining <= 0:
+            del self._mem[key]
+            return None
+        remaining_seconds = math.floor(remaining)
+        return remaining_seconds if remaining_seconds > 0 else None
+
+    async def ttl_if_values(
+        self,
+        key: str,
+        expected: str,
+        bound_key: str,
+        expected_bound: str,
+    ) -> int | None:
+        """Return the shorter TTL only when both keys still have their expected values."""
+        if self._redis is not None:
+            script = """
+                if redis.call('GET', KEYS[1]) ~= ARGV[1] or
+                   redis.call('GET', KEYS[2]) ~= ARGV[2] then
+                    return -1
+                end
+                local marker_ttl = redis.call('TTL', KEYS[1])
+                local bound_ttl = redis.call('TTL', KEYS[2])
+                if marker_ttl <= 0 or bound_ttl <= 0 then
+                    return -1
+                end
+                return math.min(marker_ttl, bound_ttl)
+            """
+            try:
+                remaining = int(
+                    await self._redis.eval(script, 2, key, bound_key, expected, expected_bound)
+                )
+                return remaining if remaining > 0 else None
+            except Exception as e:
+                self._degrade(e)
+
+        now = time.time()
+        marker = self._mem.get(key)
+        bound = self._mem.get(bound_key)
+        if (
+            marker is None
+            or marker[0] <= now
+            or marker[1] != expected
+            or bound is None
+            or bound[0] <= now
+            or bound[1] != expected_bound
+        ):
+            return None
+        remaining = math.floor(min(marker[0], bound[0]) - now)
+        return remaining if remaining > 0 else None
+
+    async def setex_many_if_unchanged(
+        self,
+        expected: dict[str, str | None],
+        values: list[tuple[str, int, str]],
+    ) -> bool:
+        """Atomically write expiring values if all observed keys are unchanged."""
+        if self._redis is not None:
+            script = """
+                local n = tonumber(ARGV[1])
+                for i = 1, n do
+                    local current = redis.call('GET', KEYS[i])
+                    local present = ARGV[2 + (i - 1) * 2]
+                    local expected_value = ARGV[3 + (i - 1) * 2]
+                    if (present == '0' and current) or
+                       (present == '1' and current ~= expected_value) then
+                        return 0
+                    end
+                end
+                local offset = 2 + n * 2
+                for i = 1, #KEYS - n do
+                    local ttl = ARGV[offset + (i - 1) * 2]
+                    local value = ARGV[offset + 1 + (i - 1) * 2]
+                    redis.call('SET', KEYS[n + i], value, 'EX', ttl)
+                end
+                return 1
+            """
+            expected_items = list(expected.items())
+            keys = [key for key, _ in expected_items] + [key for key, _, _ in values]
+            args: list[str | int] = [len(expected_items)]
+            for _, value in expected_items:
+                args.extend((0, "")) if value is None else args.extend((1, value))
+            for _, ttl, value in values:
+                args.extend((ttl, value))
+            try:
+                return bool(await self._redis.eval(script, len(keys), *keys, *args))
+            except Exception as e:
+                self._degrade(e)
+
+        now = time.time()
+        for key, expected_value in expected.items():
+            entry = self._mem.get(key)
+            current = entry[1] if entry is not None and entry[0] > now else None
+            if current != expected_value:
+                return False
+        for key, ttl, value in values:
+            self._mem[key] = (now + ttl, value)
+        return True
 
 
 cache = Cache()
