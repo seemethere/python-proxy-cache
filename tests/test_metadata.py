@@ -75,6 +75,16 @@ def test_metadata_head_url_preserves_signed_query_before_suffix():
     )
 
 
+def test_recovery_and_background_failures_have_separate_keys():
+    import app.metadata as meta
+
+    artifact_url = "/artifacts/files.pythonhosted.org/packages/a.whl"
+
+    assert meta._metadata_failure_key(artifact_url, None) != meta._metadata_failure_key(
+        artifact_url, "a" * 64
+    )
+
+
 def test_extraction_url_preserves_signed_query(monkeypatch):
     artifact = "/artifacts/files.pythonhosted.org/packages/a.whl?signature=secret#sha256=abc"
     assert (
@@ -224,7 +234,7 @@ async def test_head_concurrency_is_globally_bounded(monkeypatch):
     peak = 0
 
     class FakeClient:
-        async def head(self, url):
+        async def head(self, url, **kwargs):
             nonlocal live, peak
             live += 1
             peak = max(peak, live)
@@ -253,7 +263,7 @@ async def test_probe_concurrency_bounds_cache_lookups(monkeypatch):
 
     import app.metadata as meta
 
-    monkeypatch.setattr(meta, "_probe_semaphore", asyncio.Semaphore(3))
+    monkeypatch.setattr(meta, "_cache_semaphore", asyncio.Semaphore(3))
     live = 0
     peak = 0
 
@@ -266,7 +276,7 @@ async def test_probe_concurrency_bounds_cache_lookups(monkeypatch):
         return None
 
     class FakeClient:
-        async def head(self, url):
+        async def head(self, url, **kwargs):
             return Response(200)
 
     monkeypatch.setattr(cache, "get", delayed_cache_get)
@@ -317,6 +327,62 @@ async def test_extracted_metadata_is_content_addressed_and_served(client):
     assert response.headers["cache-control"] == "public, max-age=31536000, immutable"
 
 
+async def test_v1_metadata_records_remain_readable():
+    import hashlib
+    import json
+
+    import app.metadata as meta
+
+    artifact_url = "/artifacts/files.pythonhosted.org/packages/legacy.whl"
+    wheel_sha256 = "a" * 64
+    body = "Metadata-Version: 2.4\nName: legacy\nVersion: 1.0\n"
+    metadata_sha256 = hashlib.sha256(body.encode()).hexdigest()
+    await cache.setex(meta._metadata_blob_key(artifact_url, wheel_sha256), 60, body)
+    await cache.setex(
+        meta._metadata_url_key(artifact_url),
+        60,
+        json.dumps({"wheel-sha256": wheel_sha256, "metadata-sha256": metadata_sha256}),
+    )
+
+    assert await load_metadata_for_url(artifact_url) == (body, metadata_sha256)
+
+
+async def test_v2_metadata_record_rejects_corrupt_content():
+    import json
+
+    import app.metadata as meta
+
+    artifact_url = "/artifacts/files.pythonhosted.org/packages/corrupt.whl"
+    metadata_sha256 = "b" * 64
+    await cache.setex(
+        meta._metadata_content_key(metadata_sha256),
+        60,
+        "not the content matching that digest",
+    )
+    await cache.setex(
+        meta._metadata_url_key(artifact_url),
+        60,
+        json.dumps({"schema": 2, "metadata-sha256": metadata_sha256}),
+    )
+
+    assert await load_metadata_for_url(artifact_url) is None
+
+
+async def test_v2_record_falls_back_to_rolling_compatible_body():
+    import app.metadata as meta
+
+    artifact_url = "/artifacts/files.pythonhosted.org/packages/rolling.whl"
+    content = b"Metadata-Version: 2.4\nName: rolling\nVersion: 1.0\n"
+    wheel_sha256 = "c" * 64
+    await store_extracted_metadata(artifact_url, wheel_sha256, content)
+    stored = await load_metadata_for_url(artifact_url)
+    assert stored is not None
+    metadata_sha256 = stored[1]
+    cache._mem.pop(meta._metadata_content_key(metadata_sha256))
+
+    assert await load_metadata_for_url(artifact_url) == (content.decode(), metadata_sha256)
+
+
 async def test_metadata_url_lookup_deliberately_ignores_signed_query(client):
     artifact_url = "/artifacts/files.pythonhosted.org/packages/demo.whl?signature=temporary"
     content = b"Metadata-Version: 2.4\nName: demo\nVersion: 1.0\n"
@@ -333,6 +399,233 @@ async def test_metadata_url_lookup_deliberately_ignores_signed_query(client):
     )
     assert response.status_code == 200
     assert response.content == content
+
+
+async def test_metadata_route_recovers_after_cache_local_miss(client, mock_upstream, monkeypatch):
+    import hashlib
+
+    import app.metadata as meta
+
+    monkeypatch.setattr(settings, "enable_background_metadata", True)
+    artifact_url = "/artifacts/files.pythonhosted.org/packages/demo.whl?signature=old"
+    content = b"Metadata-Version: 2.4\nName: demo\nVersion: 1.0\n"
+    expected = hashlib.sha256(content).hexdigest()
+    assert await store_extracted_metadata(artifact_url, "a" * 64, content) == {"sha256": expected}
+
+    # Simulate a request landing on another process with an isolated cache.
+    cache._mem.clear()
+    recorder = mock_upstream(
+        lambda url, headers=None: Response(404),
+        head_handler=lambda url, headers=None: Response(404),
+    )
+    extracted: list[str] = []
+
+    async def fake_extract(url: str) -> bytes:
+        extracted.append(url)
+        return content
+
+    monkeypatch.setattr(meta, "_extract_wheel_metadata", fake_extract)
+    url = "/artifacts/files.pythonhosted.org/packages/demo.whl.metadata?signature=renewed"
+    response = await client.get(url)
+
+    assert response.status_code == 200
+    assert response.content == content
+    assert response.headers["etag"] == f'"sha256:{expected}"'
+    assert extracted == ["https://files.pythonhosted.org/packages/demo.whl?signature=renewed"]
+    head = [call for call in recorder.calls if call["method"] == "HEAD"]
+    assert head[0]["url"] == (
+        "https://files.pythonhosted.org/packages/demo.whl.metadata?signature=renewed"
+    )
+    assert head[0]["kwargs"] == {"follow_redirects": False}
+
+    # Recovery publishes the content before its URL record, so the next request
+    # is a cache hit and performs no additional upstream work.
+    second = await client.get(url)
+    assert second.status_code == 200
+    assert len(recorder.calls) == 1
+    assert extracted == ["https://files.pythonhosted.org/packages/demo.whl?signature=renewed"]
+
+
+async def test_metadata_route_preserves_native_sidecar_fallback(client, mock_upstream, monkeypatch):
+    import app.metadata as meta
+
+    monkeypatch.setattr(settings, "enable_background_metadata", True)
+    recorder = mock_upstream(
+        lambda url, headers=None: Response(200),
+        head_handler=lambda url, headers=None: Response(200),
+    )
+
+    async def unexpected_extract(url: str) -> bytes:
+        raise AssertionError(f"native metadata must not extract {url}")
+
+    monkeypatch.setattr(meta, "_extract_wheel_metadata", unexpected_extract)
+    response = await client.get("/artifacts/files.pythonhosted.org/packages/native.whl.metadata")
+
+    # nginx interprets this internal 404 as its signal to fetch the canonical
+    # native sidecar from the artifact upstream.
+    assert response.status_code == 404
+    assert recorder.calls[0]["method"] == "HEAD"
+    assert recorder.calls[0]["kwargs"] == {"follow_redirects": False}
+
+
+async def test_metadata_route_recovery_is_singleflight(client, mock_upstream, monkeypatch):
+    import asyncio
+
+    import app.metadata as meta
+
+    monkeypatch.setattr(settings, "enable_background_metadata", True)
+    recorder = mock_upstream(
+        lambda url, headers=None: Response(400),
+        head_handler=lambda url, headers=None: Response(400),
+    )
+    content = b"Metadata-Version: 2.4\nName: demo\nVersion: 1.0\n"
+    extraction_started = asyncio.Event()
+    release = asyncio.Event()
+    extractions = 0
+    attempts_before = metrics["metadata_recovery_attempts"]
+    successes_before = metrics["metadata_recovery_successes"]
+
+    async def blocked_extract(url: str) -> bytes:
+        nonlocal extractions
+        extractions += 1
+        extraction_started.set()
+        await release.wait()
+        return content
+
+    monkeypatch.setattr(meta, "_extract_wheel_metadata", blocked_extract)
+    url = "/artifacts/files.pythonhosted.org/packages/concurrent.whl.metadata"
+    requests = [asyncio.create_task(client.get(url)) for _ in range(8)]
+    await extraction_started.wait()
+    release.set()
+    responses = await asyncio.gather(*requests)
+
+    assert [response.status_code for response in responses] == [200] * 8
+    assert {response.content for response in responses} == {content}
+    assert extractions == 1
+    assert len([call for call in recorder.calls if call["method"] == "HEAD"]) == 1
+    assert metrics["metadata_recovery_attempts"] == attempts_before + 1
+    assert metrics["metadata_recovery_successes"] == successes_before + 1
+
+
+async def test_metadata_cache_hit_bypasses_saturated_probe_pool(monkeypatch):
+    import asyncio
+
+    import app.metadata as meta
+
+    monkeypatch.setattr(settings, "enable_background_metadata", True)
+    artifact_url = "/artifacts/files.pythonhosted.org/packages/hot.whl"
+    content = b"Metadata-Version: 2.4\nName: hot\nVersion: 1.0\n"
+    await store_extracted_metadata(artifact_url, "d" * 64, content)
+    monkeypatch.setattr(meta, "_probe_semaphore", asyncio.Semaphore(0))
+
+    stored = await asyncio.wait_for(meta.load_or_recover_metadata_for_url(artifact_url), 0.1)
+
+    assert stored is not None
+    assert stored[0].encode() == content
+
+
+async def test_metadata_recovery_bypasses_saturated_background_extraction_pool(
+    client, mock_upstream, monkeypatch
+):
+    import asyncio
+
+    import app.metadata as meta
+
+    monkeypatch.setattr(settings, "enable_background_metadata", True)
+    monkeypatch.setattr(meta, "_extract_semaphore", asyncio.Semaphore(0))
+    mock_upstream(
+        lambda url, headers=None: Response(404),
+        head_handler=lambda url, headers=None: Response(404),
+    )
+    content = b"Metadata-Version: 2.4\nName: reserved\nVersion: 1.0\n"
+
+    async def extract(url: str) -> bytes:
+        return content
+
+    monkeypatch.setattr(meta, "_extract_wheel_metadata", extract)
+    response = await asyncio.wait_for(
+        client.get("/artifacts/files.pythonhosted.org/packages/reserved.whl.metadata"),
+        0.1,
+    )
+
+    assert response.status_code == 200
+    assert response.content == content
+
+
+async def test_background_probe_rejects_metadata_for_different_wheel_hash(monkeypatch):
+    import hashlib
+
+    import app.metadata as meta
+
+    artifact_url = "/artifacts/files.pythonhosted.org/packages/replaced.whl"
+    old_content = b"Metadata-Version: 2.4\nName: replaced\nVersion: 1.0\n"
+    new_content = b"Metadata-Version: 2.4\nName: replaced\nVersion: 2.0\n"
+    await store_extracted_metadata(artifact_url, "a" * 64, old_content)
+
+    class FakeClient:
+        async def head(self, url, **kwargs):
+            return Response(404)
+
+    extracted: list[str] = []
+
+    async def fake_extract(url: str) -> bytes:
+        extracted.append(url)
+        return new_content
+
+    monkeypatch.setattr(meta, "get_http_client", lambda: FakeClient())
+    monkeypatch.setattr(meta, "_extract_wheel_metadata", fake_extract)
+    file = File(
+        filename="replaced.whl",
+        url=artifact_url,
+        hashes={"sha256": "b" * 64},
+    )
+
+    result = await _probe(file)
+
+    assert extracted == ["https://files.pythonhosted.org/packages/replaced.whl"]
+    assert result.core_metadata == {"sha256": hashlib.sha256(new_content).hexdigest()}
+
+
+async def test_recovery_kill_switch_performs_no_upstream_io(client, mock_upstream, monkeypatch):
+    import app.metadata as meta
+
+    monkeypatch.setattr(settings, "enable_background_metadata", False)
+    recorder = mock_upstream(lambda url, headers=None: Response(500))
+
+    async def unexpected_extract(url: str) -> bytes:
+        raise AssertionError(f"recovery disabled but extracted {url}")
+
+    monkeypatch.setattr(meta, "_extract_wheel_metadata", unexpected_extract)
+    response = await client.get("/artifacts/files.pythonhosted.org/packages/disabled.whl.metadata")
+
+    assert response.status_code == 404
+    assert recorder.calls == []
+
+
+async def test_metadata_route_failure_is_negatively_cached(client, mock_upstream, monkeypatch):
+    import app.metadata as meta
+
+    monkeypatch.setattr(settings, "enable_background_metadata", True)
+    recorder = mock_upstream(
+        lambda url, headers=None: Response(404),
+        head_handler=lambda url, headers=None: Response(404),
+    )
+    extractions = 0
+
+    async def failed_extract(url: str) -> bytes:
+        nonlocal extractions
+        extractions += 1
+        raise ValueError("malformed wheel")
+
+    monkeypatch.setattr(meta, "_extract_wheel_metadata", failed_extract)
+    url = "/artifacts/files.pythonhosted.org/packages/broken.whl.metadata"
+
+    assert (await client.get(url)).status_code == 404
+    assert (await client.get(url)).status_code == 404
+    assert extractions == 1
+    # Native metadata is still rechecked before consulting the extraction
+    # failure cache, so a newly published native sidecar remains discoverable.
+    assert len([call for call in recorder.calls if call["method"] == "HEAD"]) == 2
 
 
 async def test_metadata_route_fails_closed(client):
@@ -424,7 +717,7 @@ async def test_same_declared_wheel_sha_is_scoped_to_artifact_url(monkeypatch):
     calls: list[str] = []
 
     class FakeClient:
-        async def head(self, url):
+        async def head(self, url, **kwargs):
             return Response(404)
 
     async def fake_extract(url: str) -> bytes:

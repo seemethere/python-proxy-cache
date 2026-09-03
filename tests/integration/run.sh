@@ -76,6 +76,18 @@ has "generated metadata body" "$(cat /tmp/ppcit-metadata)" "Name: demo"
 META_HEADERS=$(curl -s -D- -o /dev/null "$META_URL" | tr -d '\r')
 has "metadata served by Python" "$META_HEADERS" "x-content-type-options: nosniff"
 
+# Simulate the metadata request landing on another process whose local cache
+# does not contain the object advertised by the project response. A unique
+# query also bypasses nginx's existing metadata entry without changing the
+# proxy's stable artifact identity.
+$COMPOSE exec -T redis redis-cli FLUSHDB >/dev/null
+RECOVERED_STATUS=$(curl -s -o /tmp/ppcit-metadata-recovered -w '%{http_code}' \
+  "$META_URL?cache-instance=other")
+check "generated metadata recovers after cache-local miss" "$RECOVERED_STATUS" "200"
+check "recovered metadata bytes match" \
+  "$(sha256sum /tmp/ppcit-metadata-recovered | awk '{print $1}')" \
+  "$(sha256sum /tmp/ppcit-metadata | awk '{print $1}')"
+
 META_BAD=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/artifacts/evil.example/demo.whl.metadata")
 check "metadata allowlist enforced" "$META_BAD" "403"
 
@@ -130,6 +142,8 @@ echo "=== metrics surface ==="
 MT=$(curl -s "$BASE/metrics")
 has "probe error counter" "$MT" "proxy_cache_redis_probe_errors_total"
 has "backend gauge"       "$MT" "proxy_cache_backend"
+RECOVERIES=$(echo "$MT" | awk '/proxy_metadata_recovery_successes_total/{print $2}')
+if [ "${RECOVERIES:-0}" -gt 0 ]; then ok "metadata recovery counter ($RECOVERIES)"; else bad "metadata recovery counter" "none recorded"; fi
 
 echo
 echo "================================"

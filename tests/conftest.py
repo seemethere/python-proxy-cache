@@ -36,8 +36,15 @@ class UpstreamRecorder:
             return result
         return await result
 
-    async def head(self, url, headers=None) -> Response:
-        self.calls.append({"method": "HEAD", "url": str(url), "headers": dict(headers or {})})
+    async def head(self, url, headers=None, **kwargs) -> Response:
+        self.calls.append(
+            {
+                "method": "HEAD",
+                "url": str(url),
+                "headers": dict(headers or {}),
+                "kwargs": kwargs,
+            }
+        )
         head_handler = self.head_handler or self.handler
         result = head_handler(url, headers)
         if isinstance(result, Response):

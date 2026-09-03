@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     # Hard bound on scheduled enrichment tasks (running plus queued).
     metadata_max_pending_projects: int = 16
     metadata_extract_concurrency: int = 2
+    # Reserved request-path extraction capacity. Keeping it separate prevents a
+    # speculative enrichment backlog from starving an advertised metadata URL.
+    metadata_recovery_concurrency: int = 2
     # Maximum wheels extracted during one project enrichment. Upstream metadata
     # HEAD probes remain uncapped by this setting (but concurrency-bounded).
     metadata_max_extract_files_per_project: int = 32
