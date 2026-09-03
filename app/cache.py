@@ -167,6 +167,64 @@ class Cache:
             del self._mem[key]
         return None
 
+    async def get_many(self, keys: list[str]) -> list[str | None]:
+        """Fetch several keys in one backend round trip.
+
+        A live Redis miss deliberately does not consult the local fallback, just
+        like :meth:`get`. If Redis fails, all keys are read from the degraded
+        in-memory cache so one batch cannot mix values from two cache backends.
+        """
+        if not keys:
+            return []
+        if self._redis is not None:
+            try:
+                values = await self._redis.mget(keys)
+                return [
+                    value.decode()
+                    if isinstance(value, bytes)
+                    else str(value)
+                    if value is not None
+                    else None
+                    for value in values
+                ]
+            except Exception as e:
+                self._degrade(e)
+
+        now = time.time()
+        values: list[str | None] = []
+        for key in keys:
+            entry = self._mem.get(key)
+            if entry is None:
+                values.append(None)
+            elif entry[0] > now:
+                values.append(entry[1])
+            else:
+                del self._mem[key]
+                values.append(None)
+        return values
+
+    async def exists_any(self, keys: list[str]) -> bool:
+        """Return whether any key is live without loading its value."""
+        if not keys:
+            return False
+        if self._redis is not None:
+            try:
+                return bool(await self._redis.exists(*keys))
+            except Exception as e:
+                self._degrade(e)
+
+        now = time.time()
+        found = False
+        for key in keys:
+            entry = self._mem.get(key)
+            if entry is None:
+                continue
+            if entry[0] > now:
+                found = True
+            else:
+                del self._mem[key]
+        return found
+
     async def setex(self, key: str, ttl: int, value: str) -> None:
         if self._redis is not None:
             try:
@@ -175,6 +233,24 @@ class Cache:
             except Exception as e:
                 self._degrade(e)
         self._mem[key] = (time.time() + ttl, value)
+
+    async def setex_many(self, values: list[tuple[str, int, str]]) -> None:
+        """Atomically store several expiring values in one backend round trip."""
+        if not values:
+            return
+        if self._redis is not None:
+            try:
+                pipeline = self._redis.pipeline(transaction=True)
+                for key, ttl, value in values:
+                    pipeline.set(key, value, ex=ttl)
+                await pipeline.execute()
+                return
+            except Exception as e:
+                self._degrade(e)
+
+        now = time.time()
+        for key, ttl, value in values:
+            self._mem[key] = (now + ttl, value)
 
     async def ttl(self, key: str) -> int | None:
         """Return the remaining whole-second lifetime for a live key."""

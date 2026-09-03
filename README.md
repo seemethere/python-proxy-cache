@@ -75,11 +75,13 @@ longer-lived project-response cache.
 See [bench/README.md](bench/README.md). TL;DR:
 
 - `X-Cache` reports the Python project cache (Redis or memory).
-- `X-Nginx-Cache` reports nginx response caching, including artifact slices.
+- `X-Nginx-Cache` reports nginx response caching for Simple responses and artifact slices.
 - Do not combine Simple and artifact nginx statuses into one hit rate. With background
-  metadata enrichment enabled, Simple responses are intentionally `no-store` at nginx
-  while their Python project-cache result is still reported by `X-Cache`.
-- `MISS+synthesis` = upstream RTT + 5-15ms parse overhead
+  metadata enrichment enabled, pending Simple responses use the short configured
+  microcache TTL and completed responses use their remaining project TTL. `X-Cache`
+  can be a header stored in an nginx response, so it indicates a Python traversal only
+  when nginx forwards the request.
+- `MISS+synthesis` adds page-size-dependent parse, rewrite, and cache-write work to the upstream RTT.
 - Use `bench/bench.py --compare` to measure degradation vs direct upstream, and `locust` to simulate 1000s runners.
 
 Metrics: `GET /metrics` contains Python project-cache counters. Use `X-Nginx-Cache` for

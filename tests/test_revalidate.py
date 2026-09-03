@@ -171,19 +171,19 @@ async def test_304_with_vanished_stale_refetches_unconditionally(client, mock_up
     await cache.setex("simple:demo:html:stale", 600, HTML)
 
     # Drop the stale body after the have_stale pre-flight has already passed.
-    orig_get = cache.get
+    orig_exists_any = cache.exists_any
 
-    async def vanishing_get(key: str):
-        value = await orig_get(key)
-        if key == "simple:demo:html:stale":
-            cache._mem.pop(key, None)
-        return value
+    async def vanishing_exists_any(keys: list[str]):
+        exists = await orig_exists_any(keys)
+        if "simple:demo:html:stale" in keys:
+            cache._mem.pop("simple:demo:html:stale", None)
+        return exists
 
-    cache.get = vanishing_get  # ty: ignore[invalid-assignment]
+    cache.exists_any = vanishing_exists_any  # ty: ignore[invalid-assignment]
     try:
         r = await client.get("/simple/demo/", headers={"Accept": "text/html"})
     finally:
-        cache.get = orig_get  # ty: ignore[invalid-assignment]
+        cache.exists_any = orig_exists_any  # ty: ignore[invalid-assignment]
 
     assert r.status_code == 200
     assert "a.whl" in r.text
@@ -196,19 +196,19 @@ async def test_304_with_no_stale_anywhere_still_502s(client, mock_upstream):
     await cache.setex("simple:demo:etag", 600, '"x"')
     await cache.setex("simple:demo:html:stale", 600, HTML)
 
-    orig_get = cache.get
+    orig_exists_any = cache.exists_any
 
-    async def vanishing_get(key: str):
-        value = await orig_get(key)
-        if key == "simple:demo:html:stale":
-            cache._mem.pop(key, None)
-        return value
+    async def vanishing_exists_any(keys: list[str]):
+        exists = await orig_exists_any(keys)
+        if "simple:demo:html:stale" in keys:
+            cache._mem.pop("simple:demo:html:stale", None)
+        return exists
 
-    cache.get = vanishing_get  # ty: ignore[invalid-assignment]
+    cache.exists_any = vanishing_exists_any  # ty: ignore[invalid-assignment]
     try:
         r = await client.get("/simple/demo/", headers={"Accept": "text/html"})
     finally:
-        cache.get = orig_get  # ty: ignore[invalid-assignment]
+        cache.exists_any = orig_exists_any  # ty: ignore[invalid-assignment]
     assert r.status_code == 502
 
 
@@ -231,13 +231,13 @@ async def test_304_synthesizes_from_opposite_stale(client, mock_upstream):
 
 async def test_cache_control_shortens_setex_ttl(client, mock_upstream, monkeypatch):
     recorded: list[tuple[str, int]] = []
-    orig = cache.setex
+    orig = cache.setex_many
 
-    async def spy(key: str, ttl: int, value: str):
-        recorded.append((key, ttl))
-        return await orig(key, ttl, value)
+    async def spy(values: list[tuple[str, int, str]]):
+        recorded.extend((key, ttl) for key, ttl, _ in values)
+        return await orig(values)
 
-    monkeypatch.setattr(cache, "setex", spy)
+    monkeypatch.setattr(cache, "setex_many", spy)
     mock_upstream(
         lambda url, headers=None: Response(
             200,

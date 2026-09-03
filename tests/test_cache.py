@@ -13,6 +13,7 @@ class FakeRedis:
         self.fail_get = fail_get
         self.fail_set = fail_set
         self.fail_ping = fail_ping
+        self.last_pipeline_transaction: bool | None = None
 
     async def ping(self):
         if self.fail_ping:
@@ -24,13 +25,45 @@ class FakeRedis:
             raise ConnectionError("get failed")
         return self.store.get(key)
 
+    async def mget(self, keys: list[str]):
+        if self.fail_get:
+            raise ConnectionError("get failed")
+        return [self.store.get(key) for key in keys]
+
+    async def exists(self, *keys: str):
+        if self.fail_get:
+            raise ConnectionError("get failed")
+        return sum(key in self.store for key in keys)
+
     async def set(self, key: str, value: str, ex: int | None = None):
         if self.fail_set:
             raise ConnectionError("set failed")
         self.store[key] = value
 
+    def pipeline(self, transaction: bool = True):
+        self.last_pipeline_transaction = transaction
+        return FakePipeline(self, transaction=transaction)
+
     async def delete(self, key: str):
         self.store.pop(key, None)
+
+
+class FakePipeline:
+    def __init__(self, redis: FakeRedis, *, transaction: bool):
+        self.redis = redis
+        self.transaction = transaction
+        self.commands: list[tuple[str, str, int | None]] = []
+
+    def set(self, key: str, value: str, ex: int | None = None):
+        self.commands.append((key, value, ex))
+        return self
+
+    async def execute(self):
+        if self.redis.fail_set:
+            raise ConnectionError("set failed")
+        for key, value, ex in self.commands:
+            await self.redis.set(key, value, ex=ex)
+        return [True] * len(self.commands)
 
 
 @pytest.mark.asyncio
@@ -41,6 +74,32 @@ async def test_memory_backend_ignores_redis():
     await c.setex("k", 60, "v")
     assert await c.get("k") == "v"
     assert await c.ping() is False
+
+
+@pytest.mark.asyncio
+async def test_memory_batch_get_and_set_preserve_order_and_expiry():
+    c = Cache(backend="memory")
+    await c.setex_many([("one", 60, "1"), ("two", 60, "2")])
+    c._mem["expired"] = (0, "old")
+
+    assert await c.get_many(["two", "missing", "one", "expired"]) == [
+        "2",
+        None,
+        "1",
+        None,
+    ]
+    assert "expired" not in c._mem
+
+
+@pytest.mark.asyncio
+async def test_memory_exists_any_does_not_load_values_and_cleans_expired_keys():
+    c = Cache(backend="memory")
+    await c.setex("live", 60, "value")
+    c._mem["expired"] = (0, "old")
+
+    assert await c.exists_any(["missing", "live", "expired"])
+    assert not await c.exists_any(["missing", "expired"])
+    assert "expired" not in c._mem
 
 
 @pytest.mark.asyncio
@@ -103,6 +162,44 @@ async def test_redis_get_failure_degrades_to_memory():
 
 
 @pytest.mark.asyncio
+async def test_redis_batch_get_preserves_order_without_memory_fallback_on_miss():
+    c = Cache(backend="redis")
+    fake = FakeRedis()
+    fake.store.update({"one": "1", "two": "2"})
+    c._mem["missing"] = (time.time() + 60, "stale-local")
+    c._redis = fake  # ty: ignore[invalid-assignment]
+    c.state = CacheState.CONNECTED
+
+    assert await c.get_many(["two", "missing", "one"]) == ["2", None, "1"]
+    assert c.state == CacheState.CONNECTED
+
+
+@pytest.mark.asyncio
+async def test_redis_exists_any_uses_backend_without_loading_values():
+    c = Cache(backend="redis")
+    fake = FakeRedis()
+    fake.store["live"] = "value"
+    c._redis = fake  # ty: ignore[invalid-assignment]
+    c.state = CacheState.CONNECTED
+
+    assert await c.exists_any(["missing", "live"])
+    assert not await c.exists_any(["missing"])
+
+
+@pytest.mark.asyncio
+async def test_redis_batch_get_failure_degrades_once_and_uses_memory():
+    c = Cache(backend="redis")
+    c._mem["local"] = (time.time() + 60, "value")
+    c._redis = FakeRedis(fail_get=True)  # ty: ignore[invalid-assignment]
+    c.state = CacheState.CONNECTED
+
+    assert await c.get_many(["local", "missing"]) == ["value", None]
+    assert c.state == CacheState.DEGRADED
+    assert c._redis is None
+    assert c.redis_errors == 1
+
+
+@pytest.mark.asyncio
 async def test_redis_set_failure_writes_memory():
     c = Cache(backend="redis")
     fake = FakeRedis(fail_set=True)
@@ -111,6 +208,33 @@ async def test_redis_set_failure_writes_memory():
     await c.setex("k", 60, "v")
     assert c.state == CacheState.DEGRADED
     assert await c.get("k") == "v"
+
+
+@pytest.mark.asyncio
+async def test_redis_batch_set_uses_transactional_pipeline():
+    c = Cache(backend="redis")
+    fake = FakeRedis()
+    c._redis = fake  # ty: ignore[invalid-assignment]
+    c.state = CacheState.CONNECTED
+
+    await c.setex_many([("one", 60, "1"), ("two", 30, "2")])
+
+    assert fake.store == {"one": "1", "two": "2"}
+    assert fake.last_pipeline_transaction is True
+    assert c.state == CacheState.CONNECTED
+
+
+@pytest.mark.asyncio
+async def test_redis_batch_set_failure_degrades_and_writes_all_to_memory():
+    c = Cache(backend="redis")
+    c._redis = FakeRedis(fail_set=True)  # ty: ignore[invalid-assignment]
+    c.state = CacheState.CONNECTED
+
+    await c.setex_many([("one", 60, "1"), ("two", 30, "2")])
+
+    assert c.state == CacheState.DEGRADED
+    assert c.redis_errors == 1
+    assert await c.get_many(["one", "two"]) == ["1", "2"]
 
 
 @pytest.mark.asyncio

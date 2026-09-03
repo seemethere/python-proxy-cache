@@ -279,17 +279,23 @@ async def test_enrichment_reuses_response_ttl(client, mock_upstream, monkeypatch
     )
     recorded: list[tuple[str, int]] = []
     orig = cache.setex
+    orig_batch = cache.setex_many
     orig_many = cache.setex_many_if_unchanged
 
     async def spy(key: str, ttl: int, value: str):
         recorded.append((key, ttl))
         return await orig(key, ttl, value)
 
+    async def spy_batch(values):
+        recorded.extend((key, ttl) for key, ttl, _ in values)
+        return await orig_batch(values)
+
     async def spy_many(expected, values):
         recorded.extend((key, ttl) for key, ttl, _ in values)
         return await orig_many(expected, values)
 
     monkeypatch.setattr(cache, "setex", spy)
+    monkeypatch.setattr(cache, "setex_many", spy_batch)
     monkeypatch.setattr(cache, "setex_many_if_unchanged", spy_many)
     mock_upstream(
         lambda url, headers=None: Response(
