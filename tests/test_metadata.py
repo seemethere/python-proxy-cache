@@ -13,6 +13,7 @@ from app.metadata import (
     drain_metadata_tasks,
     load_metadata_for_url,
     metadata_head_url,
+    metadata_response_cache_ttl,
     schedule_metadata_enrichment,
     store_extracted_metadata,
 )
@@ -137,6 +138,8 @@ async def test_metadata_probe_off_by_default(client, mock_upstream, monkeypatch)
 
 
 async def test_metadata_probe_on_enriches_cache(client, mock_upstream, monkeypatch):
+    import asyncio
+
     monkeypatch.setattr(settings, "enable_background_metadata", True)
     html = (
         "<!DOCTYPE html><html><body>"
@@ -148,8 +151,13 @@ async def test_metadata_probe_on_enriches_cache(client, mock_upstream, monkeypat
     def get_handler(url, headers=None):
         return Response(200, text=html, headers={"content-type": "text/html"})
 
-    def head_handler(url, headers=None):
+    head_started = asyncio.Event()
+    release_head = asyncio.Event()
+
+    async def head_handler(url, headers=None):
         assert str(url).endswith(".metadata")
+        head_started.set()
+        await release_head.wait()
         return Response(200)
 
     rec = mock_upstream(get_handler, head_handler=head_handler)
@@ -161,6 +169,15 @@ async def test_metadata_probe_on_enriches_cache(client, mock_upstream, monkeypat
     assert r.json()["files"][0].get("core-metadata") is False
     assert r.headers["cache-control"] == "no-store"
 
+    await head_started.wait()
+    pending = await client.get(
+        "/simple/metaon/", headers={"Accept": "application/vnd.pypi.simple.v1+json"}
+    )
+    assert pending.headers["x-cache"] == "HIT"
+    assert pending.json()["files"][0]["core-metadata"] is False
+    assert pending.headers["cache-control"] == "no-store"
+
+    release_head.set()
     await drain_metadata_tasks()
     assert any(c["method"] == "HEAD" for c in rec.calls)
 
@@ -173,6 +190,64 @@ async def test_metadata_probe_on_enriches_cache(client, mock_upstream, monkeypat
     data = json.loads(body)
     assert data["files"][0]["core-metadata"] is True
 
+    cached_json = await client.get(
+        "/simple/metaon/", headers={"Accept": "application/vnd.pypi.simple.v1+json"}
+    )
+    assert cached_json.json()["files"][0]["core-metadata"] is True
+    assert cached_json.headers["cache-control"].startswith("public, max-age=")
+    assert "accept" in cached_json.headers["vary"].lower()
+
+    pending_html = await client.get("/simple/metaon/", headers={"Accept": "text/html"})
+    assert pending_html.headers["cache-control"] == "no-store"
+    await drain_metadata_tasks()
+    cached_html = await client.get("/simple/metaon/", headers={"Accept": "text/html"})
+    assert 'data-core-metadata="true"' in cached_html.text
+    assert cached_html.headers["cache-control"].startswith("public, max-age=")
+    assert "accept" in cached_html.headers["vary"].lower()
+
+
+async def test_completed_noop_enrichment_makes_exact_body_cacheable(
+    client, mock_upstream, monkeypatch
+):
+    monkeypatch.setattr(settings, "enable_background_metadata", True)
+    html = (
+        "<!DOCTYPE html><html><body>"
+        '<a href="https://files.pythonhosted.org/packages/a-1.0-py3-none-any.whl" '
+        'data-core-metadata="true">a-1.0-py3-none-any.whl</a>'
+        "</body></html>"
+    )
+    mock_upstream(
+        lambda url, headers=None: Response(200, text=html, headers={"content-type": "text/html"})
+    )
+
+    first = await client.get("/simple/native/", headers={"Accept": "text/html"})
+    assert first.headers["cache-control"] == "no-store"
+    await drain_metadata_tasks()
+
+    second = await client.get("/simple/native/", headers={"Accept": "text/html"})
+    assert second.headers["cache-control"].startswith("public, max-age=")
+
+
+async def test_dropped_enrichment_remains_uncacheable(client, mock_upstream, monkeypatch):
+    monkeypatch.setattr(settings, "enable_background_metadata", True)
+    monkeypatch.setattr(settings, "metadata_max_pending_projects", 0)
+    html = (
+        "<!DOCTYPE html><html><body>"
+        f'<a href="https://files.pythonhosted.org/packages/a-1.0-py3-none-any.whl'
+        f'#sha256={"a" * 64}">a-1.0-py3-none-any.whl</a>'
+        "</body></html>"
+    )
+    mock_upstream(
+        lambda url, headers=None: Response(200, text=html, headers={"content-type": "text/html"})
+    )
+
+    first = await client.get("/simple/dropped/", headers={"Accept": "text/html"})
+    second = await client.get("/simple/dropped/", headers={"Accept": "text/html"})
+
+    assert first.headers["cache-control"] == "no-store"
+    assert second.headers["x-cache"] == "HIT"
+    assert second.headers["cache-control"] == "no-store"
+
 
 async def test_enrichment_reuses_response_ttl(client, mock_upstream, monkeypatch):
     """Enrichment must not extend a TTL we shortened to honour upstream max-age."""
@@ -184,12 +259,18 @@ async def test_enrichment_reuses_response_ttl(client, mock_upstream, monkeypatch
     )
     recorded: list[tuple[str, int]] = []
     orig = cache.setex
+    orig_many = cache.setex_many_if_unchanged
 
     async def spy(key: str, ttl: int, value: str):
         recorded.append((key, ttl))
         return await orig(key, ttl, value)
 
+    async def spy_many(expected, values):
+        recorded.extend((key, ttl) for key, ttl, _ in values)
+        return await orig_many(expected, values)
+
     monkeypatch.setattr(cache, "setex", spy)
+    monkeypatch.setattr(cache, "setex_many_if_unchanged", spy_many)
     mock_upstream(
         lambda url, headers=None: Response(
             200,
@@ -203,9 +284,14 @@ async def test_enrichment_reuses_response_ttl(client, mock_upstream, monkeypatch
 
     primary = [ttl for key, ttl in recorded if key == "simple:ttlcheck:html"]
     assert primary, "primary key was never written"
-    # every write of the primary key uses the upstream-derived TTL, including
-    # the one the background enrichment makes
-    assert set(primary) == {7}
+    # Enrichment may preserve only the source's remaining lifetime; it must
+    # never restart the full upstream-derived TTL.
+    assert primary[0] == 7
+    assert all(1 <= value <= 7 for value in primary)
+    assert primary[-1] <= primary[0]
+    cached = await client.get("/simple/ttlcheck/", headers={"Accept": "text/html"})
+    max_age = int(cached.headers["cache-control"].rsplit("=", 1)[1])
+    assert 1 <= max_age <= 7
 
 
 async def test_enrichment_does_not_clobber_a_newer_body(client, mock_upstream, monkeypatch):
@@ -218,6 +304,17 @@ async def test_enrichment_does_not_clobber_a_newer_body(client, mock_upstream, m
     # enrich from a body that is no longer what is cached
     await _enrich("racy", stale_source, is_json=False, ttl=60)
     assert await cache.get("simple:racy:html") == "<html><body>NEW</body></html>"
+    assert (
+        await metadata_response_cache_ttl("racy", "<html><body>NEW</body></html>", is_json=False)
+        is None
+    )
+
+
+async def test_invalid_or_wrong_readiness_marker_is_not_cacheable():
+    body = "<html><body>exact</body></html>"
+    await cache.setex("simple:marker:html", 60, body)
+    await cache.setex("simple:marker:html:metadata-ready", 60, "not-a-body-digest")
+    assert await metadata_response_cache_ttl("marker", body, is_json=False) is None
 
 
 async def test_head_concurrency_is_globally_bounded(monkeypatch):

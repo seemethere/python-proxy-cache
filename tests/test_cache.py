@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from app.cache import Cache, CacheState
@@ -39,6 +41,44 @@ async def test_memory_backend_ignores_redis():
     await c.setex("k", 60, "v")
     assert await c.get("k") == "v"
     assert await c.ping() is False
+
+
+@pytest.mark.asyncio
+async def test_memory_ttl_tracks_live_key():
+    c = Cache(backend="memory")
+    await c.setex("k", 60, "v")
+    assert 1 <= (await c.ttl("k") or 0) <= 60
+    c._mem["expired"] = (0, "v")
+    assert await c.ttl("expired") is None
+    c._mem["almost-expired"] = (time.time() + 0.5, "v")
+    assert await c.ttl("almost-expired") is None
+
+
+@pytest.mark.asyncio
+async def test_memory_ttl_if_values_checks_marker_and_bound_key():
+    c = Cache(backend="memory")
+    await c.setex("marker", 30, "digest")
+    await c.setex("body", 60, "body")
+    assert 1 <= (await c.ttl_if_values("marker", "digest", "body", "body") or 0) <= 30
+    assert await c.ttl_if_values("marker", "wrong", "body", "body") is None
+    assert await c.ttl_if_values("marker", "digest", "body", "wrong") is None
+    assert await c.ttl_if_values("marker", "digest", "missing", "body") is None
+
+
+@pytest.mark.asyncio
+async def test_memory_conditional_multi_write_is_atomic():
+    c = Cache(backend="memory")
+    await c.setex("source", 60, "old")
+    assert await c.setex_many_if_unchanged(
+        {"source": "old", "other": None}, [("source", 60, "new"), ("ready", 60, "yes")]
+    )
+    assert await c.get("source") == "new"
+    assert await c.get("ready") == "yes"
+    assert not await c.setex_many_if_unchanged(
+        {"source": "old"}, [("source", 60, "bad"), ("ready", 60, "bad")]
+    )
+    assert await c.get("source") == "new"
+    assert await c.get("ready") == "yes"
 
 
 @pytest.mark.asyncio

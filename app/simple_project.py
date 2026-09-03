@@ -13,7 +13,11 @@ from app.artifacts import rewrite_project_urls, rewrite_simple_body
 from app.cache import cache
 from app.config import settings
 from app.deps import get_http_client
-from app.metadata import schedule_metadata_enrichment
+from app.metadata import (
+    metadata_response_cache_ttl,
+    refresh_metadata_response_readiness,
+    schedule_metadata_enrichment,
+)
 from app.metrics import metrics
 from app.parse import model_to_html, model_to_json, parse_simple_html, parse_simple_json
 from app.singleflight import miss_locks
@@ -24,17 +28,29 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def _cached_response(body: str, *, wants_json: bool, canonical: str, start: float) -> Response:
+async def _cached_response(
+    body: str, *, wants_json: bool, canonical: str, start: float
+) -> Response:
     ct = "application/vnd.pypi.simple.v1+json" if wants_json else "text/html"
+    headers = {
+        "X-Cache": "HIT",
+        "X-Cache-Key": canonical,
+        "X-Synthesis": "0",
+        "Server-Timing": f"cache;dur={(time.perf_counter() - start) * 1000:.1f}",
+    }
+    if settings.enable_background_metadata:
+        cache_ttl = await metadata_response_cache_ttl(canonical, body, is_json=wants_json)
+        if cache_ttl is not None:
+            headers["Cache-Control"] = f"public, max-age={cache_ttl}"
+        else:
+            output_format = "json" if wants_json else "html"
+            body_ttl = await cache.ttl(f"simple:{canonical}:{output_format}")
+            if body_ttl is not None:
+                schedule_metadata_enrichment(canonical, body, is_json=wants_json, ttl=body_ttl)
     return Response(
         body,
         media_type=ct,
-        headers={
-            "X-Cache": "HIT",
-            "X-Cache-Key": canonical,
-            "X-Synthesis": "0",
-            "Server-Timing": f"cache;dur={(time.perf_counter() - start) * 1000:.1f}",
-        },
+        headers=headers,
     )
 
 
@@ -58,7 +74,9 @@ async def _try_serve_from_cache(
 
     if cached := await cache.get(cache_key):
         metrics["cache_hits"] += 1
-        return _cached_response(cached, wants_json=wants_json, canonical=canonical, start=start)
+        return await _cached_response(
+            cached, wants_json=wants_json, canonical=canonical, start=start
+        )
 
     # opposite format is cached -> synthesize without going upstream
     if other_cached := await cache.get(other_key):
@@ -197,6 +215,10 @@ async def simple_project(project: str, request: Request, accept: str | None = He
                 # effective TTL respects upstream Cache-Control if present on 304
                 eff_ttl = effective_project_ttl(r.headers)
                 await cache.setex(cache_key, eff_ttl, stale_body)
+                if settings.enable_background_metadata:
+                    await refresh_metadata_response_readiness(
+                        canonical, stale_body, is_json=wants_json, ttl=eff_ttl
+                    )
                 # refresh etag/lastmod TTL
                 if etag:
                     await cache.setex(etag_key, stale_ttl, etag)
@@ -208,17 +230,14 @@ async def simple_project(project: str, request: Request, accept: str | None = He
                     await cache.setex(other_key, eff_ttl, other_stale)
                 metrics["cache_hits"] += 1
                 metrics["upstream_fetches"] += 1
-                ct = "application/vnd.pypi.simple.v1+json" if wants_json else "text/html"
-                return Response(
-                    stale_body,
-                    media_type=ct,
-                    headers={
-                        "X-Cache": "REVALIDATED",
-                        "X-Cache-Key": canonical,
-                        "X-Synthesis": "0",
-                        "Server-Timing": f"revalidated;dur={(time.perf_counter() - start) * 1000:.1f}",
-                    },
+                response = await _cached_response(
+                    stale_body, wants_json=wants_json, canonical=canonical, start=start
                 )
+                response.headers["X-Cache"] = "REVALIDATED"
+                response.headers["Server-Timing"] = (
+                    f"revalidated;dur={(time.perf_counter() - start) * 1000:.1f}"
+                )
+                return response
 
         if r.status_code == 404:
             # Distinct key so a cached 404 never returns as a 200 HIT on the success path.

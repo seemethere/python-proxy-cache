@@ -4,6 +4,7 @@ from httpx import Response
 
 from app.cache import cache
 from app.config import settings
+from app.metadata import drain_metadata_tasks
 
 HTML = (
     "<!DOCTYPE html><html><body>"
@@ -63,6 +64,40 @@ async def test_revalidate_304_with_etag(client, mock_upstream):
     assert r2.headers.get("x-cache") == "REVALIDATED"
     assert "a.whl" in r2.text
     assert rec.call_count == 2
+
+
+async def test_completed_metadata_stays_cacheable_after_304(client, mock_upstream, monkeypatch):
+    monkeypatch.setattr(settings, "enable_background_metadata", True)
+    enriched_html = HTML.replace(">a.whl</a>", ' data-core-metadata="true">a.whl</a>')
+    state = {"n": 0}
+
+    def handler(url, headers=None):
+        state["n"] += 1
+        if state["n"] == 1:
+            return Response(
+                200,
+                text=enriched_html,
+                headers={"content-type": "text/html", "etag": '"v1"'},
+            )
+        assert (headers or {}).get("If-None-Match") == '"v1"'
+        return Response(304, headers={"etag": '"v1"'})
+
+    mock_upstream(handler)
+    first = await client.get("/simple/demo/", headers={"Accept": "text/html"})
+    assert first.headers["cache-control"] == "no-store"
+    await drain_metadata_tasks()
+
+    ready = await client.get("/simple/demo/", headers={"Accept": "text/html"})
+    assert ready.headers["cache-control"].startswith("public, max-age=")
+    cache._mem.pop("simple:demo:html", None)
+    cache._mem.pop("simple:demo:json", None)
+
+    revalidated = await client.get("/simple/demo/", headers={"Accept": "text/html"})
+    assert revalidated.headers["x-cache"] == "REVALIDATED"
+    assert revalidated.headers["cache-control"].startswith("public, max-age=")
+    again = await client.get("/simple/demo/", headers={"Accept": "text/html"})
+    assert again.headers["x-cache"] == "HIT"
+    assert again.headers["cache-control"].startswith("public, max-age=")
 
 
 async def test_revalidate_304_last_modified_only(client, mock_upstream):

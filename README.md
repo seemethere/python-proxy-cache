@@ -55,7 +55,9 @@ background ZIP extraction, while `METADATA_RECOVERY_CONCURRENCY` (default 2) res
 request-path capacity so advertised metadata can recover behind a background backlog. To keep
 large project indexes bounded, only the newest
 `METADATA_MAX_EXTRACT_FILES_PER_PROJECT` (default 32) parseable wheels missing metadata are
-probed during each project pass. Generated metadata is retained for
+probed during each project pass. Project responses remain uncacheable while enrichment is
+pending; once the exact enriched response is complete, it becomes cacheable for its remaining
+project TTL. Generated metadata is retained for
 `METADATA_CACHE_TTL_SECONDS` (default one year), while failures are retried after
 `METADATA_FAILURE_TTL_SECONDS` (default one hour). An advertised generated-metadata
 URL is self-healing: when its content is absent from the local cache, the proxy
