@@ -1,5 +1,7 @@
 from httpx import Response
 
+from app.config import settings
+
 
 async def test_404_cached_stays_404(client, mock_upstream):
     rec = mock_upstream(
@@ -21,6 +23,16 @@ async def test_404_cached_stays_404(client, mock_upstream):
     assert r2.status_code == 404
     assert r2.headers.get("x-cache") == "HIT"
     assert rec.call_count == 1  # no second upstream fetch
+
+
+async def test_metadata_microcache_does_not_override_404_policy(client, mock_upstream, monkeypatch):
+    monkeypatch.setattr(settings, "enable_background_metadata", True)
+    mock_upstream(lambda url, headers=None: Response(404, text="Not Found"))
+
+    response = await client.get("/simple/missing-with-metadata/", headers={"Accept": "text/html"})
+
+    assert response.status_code == 404
+    assert "cache-control" not in response.headers
 
 
 async def test_404_does_not_poison_200(client, mock_upstream):

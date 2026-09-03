@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     )
     http_timeout: float = 10.0
     enable_background_metadata: bool = False  # HEAD .metadata for 658/714 (off by default, lazy)
+    # Briefly cache incomplete project pages to collapse concurrent resolver
+    # bursts without hiding newly enriched metadata for the normal project TTL.
+    metadata_pending_cache_ttl_seconds: int = Field(default=1, ge=0)
     # Global cap for complete per-file metadata probes, including cache operations
     # and upstream HEADs. Without it, one large project can exhaust either pool.
     metadata_head_concurrency: int = 10

@@ -76,13 +76,24 @@ has "generated metadata body" "$(cat /tmp/ppcit-metadata)" "Name: demo"
 META_HEADERS=$(curl -s -D- -o /dev/null "$META_URL" | tr -d '\r')
 has "metadata served by Python" "$META_HEADERS" "x-content-type-options: nosniff"
 
-# The initial project response is deliberately uncacheable while enrichment is
-# pending. Once the exact enriched body is ready, nginx may cache it safely.
-curl -s -D /tmp/ppcit-project-headers -o /tmp/ppcit-project \
-  -H 'Accept: text/html' "$BASE/simple/legacy/"
+# A pending response can remain in nginx for one second. Poll until the exact
+# completed body is visible with its longer remaining project TTL.
+PROJECT_COMPLETED=0
+for i in $(seq 1 20); do
+  curl -s -D /tmp/ppcit-project-headers -o /tmp/ppcit-project \
+    -H 'Accept: text/html' "$BASE/simple/legacy/"
+  PROJECT_HEADERS=$(tr -d '\r' </tmp/ppcit-project-headers)
+  if grep -q 'data-core-metadata="sha256=' /tmp/ppcit-project && \
+      printf '%s' "$PROJECT_HEADERS" | grep -Eq 'cache-control: public, max-age=([2-9]|[1-9][0-9]+)'; then
+    PROJECT_COMPLETED=1
+    break
+  fi
+  sleep 1
+done
+check "completed project exceeds pending TTL" "$PROJECT_COMPLETED" "1"
 has "completed project advertises metadata" "$(cat /tmp/ppcit-project)" \
   'data-core-metadata="sha256='
-has "completed project is cacheable" "$(tr -d '\r' </tmp/ppcit-project-headers)" \
+has "completed project is cacheable" "$PROJECT_HEADERS" \
   'cache-control: public, max-age='
 PROJECT_CACHE=$(curl -s -D- -o /dev/null -H 'Accept: text/html' \
   "$BASE/simple/legacy/" | tr -d '\r' | awk -F': ' '/[Xx]-[Nn]ginx-[Cc]ache/{print $2}')

@@ -55,9 +55,10 @@ background ZIP extraction, while `METADATA_RECOVERY_CONCURRENCY` (default 2) res
 request-path capacity so advertised metadata can recover behind a background backlog. To keep
 large project indexes bounded, only the newest
 `METADATA_MAX_EXTRACT_FILES_PER_PROJECT` (default 32) parseable wheels missing metadata are
-probed during each project pass. Project responses remain uncacheable while enrichment is
-pending; once the exact enriched response is complete, it becomes cacheable for its remaining
-project TTL. Generated metadata is retained for
+probed during each project pass. Pending project responses use a one-second outer-cache TTL by
+default to collapse concurrent bursts without hiding enrichment for the full project TTL; set
+`METADATA_PENDING_CACHE_TTL_SECONDS=0` to disable that microcache. Once the exact enriched
+response is complete, it becomes cacheable for its remaining project TTL. Generated metadata is retained for
 `METADATA_CACHE_TTL_SECONDS` (default one year), while failures are retried after
 `METADATA_FAILURE_TTL_SECONDS` (default one hour). An advertised generated-metadata
 URL is self-healing: when its content is absent from the local cache, the proxy
@@ -65,9 +66,9 @@ rechecks for native metadata and otherwise reconstructs it with the same bounded
 range reader. Shared Redis reduces duplicate work across processes but is not
 required for metadata availability.
 `ARTIFACT_HOST_SCHEME` (default `https`) is the scheme used to reach extra allowlisted hosts.
-While enrichment is enabled, project responses carry `Cache-Control: no-store` so an outer
-proxy cannot hide a newly enriched response behind its earlier unannotated copy; Redis remains
-the project-response cache.
+While enrichment is enabled, only exact completed responses receive the full remaining project
+TTL. Pending responses receive the bounded microcache TTL described above; Redis remains the
+longer-lived project-response cache.
 
 ## Perf
 

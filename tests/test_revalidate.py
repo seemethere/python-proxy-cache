@@ -84,20 +84,23 @@ async def test_completed_metadata_stays_cacheable_after_304(client, mock_upstrea
 
     mock_upstream(handler)
     first = await client.get("/simple/demo/", headers={"Accept": "text/html"})
-    assert first.headers["cache-control"] == "no-store"
+    assert first.headers["cache-control"] == "public, max-age=1"
     await drain_metadata_tasks()
 
     ready = await client.get("/simple/demo/", headers={"Accept": "text/html"})
     assert ready.headers["cache-control"].startswith("public, max-age=")
+    assert int(ready.headers["cache-control"].rsplit("=", 1)[1]) > 1
     cache._mem.pop("simple:demo:html", None)
     cache._mem.pop("simple:demo:json", None)
 
     revalidated = await client.get("/simple/demo/", headers={"Accept": "text/html"})
     assert revalidated.headers["x-cache"] == "REVALIDATED"
     assert revalidated.headers["cache-control"].startswith("public, max-age=")
+    assert int(revalidated.headers["cache-control"].rsplit("=", 1)[1]) > 1
     again = await client.get("/simple/demo/", headers={"Accept": "text/html"})
     assert again.headers["x-cache"] == "HIT"
     assert again.headers["cache-control"].startswith("public, max-age=")
+    assert int(again.headers["cache-control"].rsplit("=", 1)[1]) > 1
 
 
 async def test_revalidate_304_last_modified_only(client, mock_upstream):

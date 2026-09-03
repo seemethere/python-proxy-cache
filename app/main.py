@@ -38,26 +38,32 @@ app.include_router(simple_project_router)
 app.include_router(metadata_router)
 
 
+def _vary_on_accept(response: Response) -> None:
+    vary = [value.strip() for value in response.headers.get("vary", "").split(",") if value.strip()]
+    if "*" not in vary and not any(value.lower() == "accept" for value in vary):
+        vary.append("Accept")
+    response.headers["Vary"] = ", ".join(vary)
+
+
 @app.middleware("http")
 async def metadata_enrichment_cache_control(request: Request, call_next):
     response = await call_next(request)
     is_project = request.url.path.startswith("/simple/") and request.url.path != "/simple/"
     if is_project:
-        vary = [
-            value.strip() for value in response.headers.get("vary", "").split(",") if value.strip()
-        ]
-        if "*" not in vary and not any(value.lower() == "accept" for value in vary):
-            vary.append("Accept")
-        response.headers["Vary"] = ", ".join(vary)
+        _vary_on_accept(response)
     # The first response can be returned before background extraction updates
-    # Redis. Do not let an outer proxy retain that unenriched project page and
-    # hide the completed result. The root project listing is not enriched.
+    # Redis. Give it only a tiny outer-cache lifetime so concurrent resolver
+    # bursts collapse without hiding the completed response for the full TTL.
     if (
         settings.enable_background_metadata
         and is_project
+        and response.status_code == 200
         and "cache-control" not in response.headers
     ):
-        response.headers["Cache-Control"] = "no-store"
+        pending_ttl = settings.metadata_pending_cache_ttl_seconds
+        response.headers["Cache-Control"] = (
+            f"public, max-age={pending_ttl}" if pending_ttl > 0 else "no-store"
+        )
     return response
 
 
