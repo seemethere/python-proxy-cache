@@ -16,6 +16,7 @@ services:
       CACHE_BACKEND: "redis"
       CACHE_TTL_SECONDS: "300"
       ENABLE_BACKGROUND_METADATA: "${ENABLE_BACKGROUND_METADATA:-false}"
+      METADATA_PENDING_CACHE_TTL_SECONDS: "${METADATA_PENDING_CACHE_TTL_SECONDS:-1}"
       # Extract through nginx so range reads populate/share the artifact cache.
       METADATA_ARTIFACT_BASE_URL: "http://nginx"
     depends_on: [redis]
