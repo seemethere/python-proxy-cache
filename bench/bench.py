@@ -46,13 +46,30 @@ def cache_summary(url: str, samples: list[tuple[int, str, str]]) -> dict:
     """Summarize only the cache layer responsible for the requested path."""
     path = urlparse(url).path
     python_statuses = Counter()
+    nginx_simple_statuses = Counter()
     nginx_statuses = Counter()
 
     for status_code, python_cache, nginx_cache in samples:
         if status_code >= 400:
             continue
-        if path.startswith("/simple/") and python_cache not in {"", "-"}:
-            python_statuses[python_cache] += 1
+        if path.startswith("/simple/"):
+            if nginx_cache not in {"", "-"}:
+                nginx_simple_statuses[nginx_cache] += 1
+            # nginx preserves the X-Cache header stored with a cached response.
+            # Count it as a Python traversal only when nginx actually forwarded
+            # this request, or when benchmarking Python directly.
+            if nginx_cache in {
+                "",
+                "-",
+                "MISS",
+                "BYPASS",
+                "EXPIRED",
+                "REVALIDATED",
+            } and python_cache not in {
+                "",
+                "-",
+            }:
+                python_statuses[python_cache] += 1
         elif path.startswith(("/artifacts/", "/packages/", "/files/")) and nginx_cache not in {
             "",
             "-",
@@ -71,6 +88,10 @@ def cache_summary(url: str, samples: list[tuple[int, str, str]]) -> dict:
 
     return {
         "python_project_cache": summarize(python_statuses, {"HIT", "HIT-synthesized"}),
+        "nginx_simple_cache": summarize(
+            nginx_simple_statuses,
+            {"HIT", "REVALIDATED", "STALE", "UPDATING"},
+        ),
         "nginx_artifact_cache": summarize(nginx_statuses, {"HIT"}),
     }
 
@@ -83,6 +104,7 @@ async def run_load(
     total: int,
     url: str | None = None,
     range_header: str | None = None,
+    warmup: bool = True,
 ):
     url = url or f"{base.rstrip('/')}/simple/{project}/"
     limits = httpx.Limits(max_connections=concurrency * 2, max_keepalive_connections=concurrency)
@@ -100,9 +122,9 @@ async def run_load(
                 statuses.append((sc, python_cache, nginx_cache))
                 return dt
 
-        # warmup 1
-        await fetch(client, url, accept, range_header)
-        await asyncio.sleep(0.2)
+        if warmup:
+            await fetch(client, url, accept, range_header)
+            await asyncio.sleep(0.2)
         t0 = time.perf_counter()
         await asyncio.gather(*[one() for _ in range(total)])
         elapsed = time.perf_counter() - t0
@@ -188,6 +210,11 @@ def main():
     p.add_argument(
         "--compare", action="store_true", help="run single-request comparison vs upstream"
     )
+    p.add_argument(
+        "--no-warmup",
+        action="store_true",
+        help="skip the client warmup request; clear or vary server caches separately",
+    )
     args = p.parse_args()
 
     if args.compare:
@@ -203,6 +230,7 @@ def main():
             args.requests,
             args.url,
             args.range_header,
+            warmup=not args.no_warmup,
         )
     )
     t = Table(

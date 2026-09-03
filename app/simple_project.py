@@ -64,7 +64,8 @@ async def _try_serve_from_cache(
     by the leader pick up the freshly filled entry instead of refetching.
     Raises HTTPException(404) on a negative-cache hit.
     """
-    if await cache.get(f"simple:{canonical}:404") is not None:
+    not_found, cached = await cache.get_many([f"simple:{canonical}:404", cache_key])
+    if not_found is not None:
         metrics["cache_hits"] += 1
         raise HTTPException(
             status_code=404,
@@ -72,14 +73,16 @@ async def _try_serve_from_cache(
             headers={"X-Cache": "HIT", "X-Cache-Key": canonical},
         )
 
-    if cached := await cache.get(cache_key):
+    if cached:
         metrics["cache_hits"] += 1
         return await _cached_response(
             cached, wants_json=wants_json, canonical=canonical, start=start
         )
 
-    # opposite format is cached -> synthesize without going upstream
-    if other_cached := await cache.get(other_key):
+    # Fetch the large opposite body only after the requested representation misses.
+    # This keeps the common exact-format HIT to one body transfer from Redis.
+    other_cached = await cache.get(other_key)
+    if other_cached:
         try:
             if wants_json:
                 proj = parse_simple_html(canonical, other_cached)
@@ -92,9 +95,26 @@ async def _try_serve_from_cache(
         except (ValueError, TypeError, KeyError):
             # unparseable cache entry — fall through to an upstream fetch
             return None
-        await cache.setex(cache_key, settings.cache_project_ttl_seconds, body)
-        # keep stale copy for revalidation window
-        await cache.setex(f"{cache_key}:stale", settings.cache_stale_ttl_seconds, body)
+        # Sample source lifetimes after the potentially expensive conversion so
+        # the target cannot regain the time spent parsing a large index.
+        other_ttl = await cache.ttl(other_key)
+        if other_ttl is None:
+            return None
+        other_stale_ttl = await cache.ttl(f"{other_key}:stale")
+        writes = [(cache_key, other_ttl, body)]
+        if other_stale_ttl is not None:
+            writes.append((f"{cache_key}:stale", other_stale_ttl, body))
+        # A source generation can be enriched or refilled while synthesis runs.
+        # Commit only if it is still the exact body we converted.
+        committed = await cache.setex_many_if_unchanged({other_key: other_cached}, writes)
+        if not committed:
+            return None
+        schedule_metadata_enrichment(
+            canonical,
+            body,
+            is_json=wants_json,
+            ttl=other_ttl,
+        )
         metrics["synthesis_count"] += 1
         metrics["cache_hits"] += 1
         return Response(
@@ -162,13 +182,12 @@ async def simple_project(project: str, request: Request, accept: str | None = He
         lastmod_key = f"simple:{canonical}:lastmod"
         etag = None
         last_mod = None
-        have_stale = (await cache.get(f"{cache_key}:stale")) is not None or (
-            await cache.get(f"{other_key}:stale")
-        ) is not None
+        have_stale = await cache.exists_any([f"{cache_key}:stale", f"{other_key}:stale"])
         if have_stale:
-            if etag := await cache.get(etag_key):
+            etag, last_mod = await cache.get_many([etag_key, lastmod_key])
+            if etag:
                 headers["If-None-Match"] = etag
-            if last_mod := await cache.get(lastmod_key):
+            if last_mod:
                 headers["If-Modified-Since"] = last_mod
 
         t0 = time.perf_counter()
@@ -179,22 +198,22 @@ async def simple_project(project: str, request: Request, accept: str | None = He
 
         # 304 Not Modified — revalidate stale body
         if r.status_code == 304:
-            stale_body = await cache.get(f"{cache_key}:stale")
-            if stale_body is None:
-                # fallback: try opposite stale then synthesize, or the other stale directly
-                other_stale = await cache.get(f"{other_key}:stale")
-                if other_stale is not None:
-                    try:
-                        if wants_json:
-                            proj = parse_simple_html(canonical, other_stale)
-                            stale_body = json.dumps(model_to_json(rewrite_project_urls(proj)))
-                        else:
-                            proj = parse_simple_json(json.loads(other_stale))
-                            stale_body = model_to_html(rewrite_project_urls(proj))
-                        # cache synthesized stale as well
-                        await cache.setex(f"{other_key}:stale", stale_ttl, other_stale)
-                    except (ValueError, TypeError, KeyError):
-                        stale_body = None
+            stale_body, other_stale = await cache.get_many(
+                [f"{cache_key}:stale", f"{other_key}:stale"]
+            )
+            # Fallback: try the opposite stale representation and synthesize.
+            if stale_body is None and other_stale is not None:
+                try:
+                    if wants_json:
+                        proj = parse_simple_html(canonical, other_stale)
+                        stale_body = json.dumps(model_to_json(rewrite_project_urls(proj)))
+                    else:
+                        proj = parse_simple_json(json.loads(other_stale))
+                        stale_body = model_to_html(rewrite_project_urls(proj))
+                    # cache synthesized stale as well
+                    await cache.setex(f"{other_key}:stale", stale_ttl, other_stale)
+                except (ValueError, TypeError, KeyError):
+                    stale_body = None
             if stale_body is None:
                 # Stale copy vanished between the have_stale check and now (TTL expiry or
                 # eviction). Drop the validators and refetch unconditionally rather than
@@ -214,20 +233,18 @@ async def simple_project(project: str, request: Request, accept: str | None = He
             else:
                 # effective TTL respects upstream Cache-Control if present on 304
                 eff_ttl = effective_project_ttl(r.headers)
-                await cache.setex(cache_key, eff_ttl, stale_body)
+                refreshed_values = [(cache_key, eff_ttl, stale_body)]
+                if etag:
+                    refreshed_values.append((etag_key, stale_ttl, etag))
+                if last_mod:
+                    refreshed_values.append((lastmod_key, stale_ttl, last_mod))
+                if other_stale:
+                    refreshed_values.append((other_key, eff_ttl, other_stale))
+                await cache.setex_many(refreshed_values)
                 if settings.enable_background_metadata:
                     await refresh_metadata_response_readiness(
                         canonical, stale_body, is_json=wants_json, ttl=eff_ttl
                     )
-                # refresh etag/lastmod TTL
-                if etag:
-                    await cache.setex(etag_key, stale_ttl, etag)
-                if last_mod:
-                    await cache.setex(lastmod_key, stale_ttl, last_mod)
-                # also refresh opposite stale's TTL if exists
-                other_stale = await cache.get(f"{other_key}:stale")
-                if other_stale:
-                    await cache.setex(other_key, eff_ttl, other_stale)
                 metrics["cache_hits"] += 1
                 metrics["upstream_fetches"] += 1
                 response = await _cached_response(
@@ -258,39 +275,30 @@ async def simple_project(project: str, request: Request, accept: str | None = He
         # persist validator headers for next conditional GET
         etag_val = r.headers.get("etag") or r.headers.get("ETag")
         lastmod_val = r.headers.get("last-modified") or r.headers.get("Last-Modified")
+        validator_values: list[tuple[str, int, str]] = []
         if etag_val:
-            await cache.setex(etag_key, stale_ttl, etag_val)
+            validator_values.append((etag_key, stale_ttl, etag_val))
         if lastmod_val:
-            await cache.setex(lastmod_key, stale_ttl, lastmod_val)
+            validator_values.append((lastmod_key, stale_ttl, lastmod_val))
 
         # --- Passthrough path: upstream already has what client wants ---
         # Store verbatim body for the matching format to avoid re-serialization loss (preserves PEP 700+ fields, whitespace, order)
-        # and only synthesize the opposite format. Add minimal overhead: 1 parse for opposite cache population.
+        # and synthesize the opposite format only if a later client requests it.
         if is_upstream_json == wants_json:
             # perfect match — cache verbatim and synthesize opposite lazily
             # URL rewrite only — every other upstream field (PEP 700 versions,
             # PEP 708 meta.tracks/alternate-locations, PEP 740 provenance, ordering,
             # unknown keys) survives, so X-Synthesis: 0 stays truthful.
             passthrough_body = rewrite_simple_body(r.text, is_json=is_upstream_json)
-            # store the rewritten passthrough
-            await cache.setex(cache_key, eff_ttl, passthrough_body)
-            await cache.setex(f"{cache_key}:stale", stale_ttl, passthrough_body)
-            # synthesize opposite format once for next request (cost is one parse, not on critical path for this response)
-            try:
-                if is_upstream_json:
-                    proj = parse_simple_json(r.json())
-                    if not proj.name:
-                        proj.name = canonical
-                    opposite_body = model_to_html(rewrite_project_urls(proj))
-                else:
-                    proj = parse_simple_html(canonical, r.text)
-                    if not proj.name:
-                        proj.name = canonical
-                    opposite_body = json.dumps(model_to_json(rewrite_project_urls(proj)))
-                await cache.setex(other_key, eff_ttl, opposite_body)
-                await cache.setex(f"{other_key}:stale", stale_ttl, opposite_body)
-            except (ValueError, TypeError, KeyError):
-                pass
+            # Store only what this request needs. The opposite representation is
+            # synthesized lazily by _try_serve_from_cache if a client asks for it.
+            await cache.setex_many(
+                [
+                    *validator_values,
+                    (cache_key, eff_ttl, passthrough_body),
+                    (f"{cache_key}:stale", stale_ttl, passthrough_body),
+                ]
+            )
             out_ct = "application/vnd.pypi.simple.v1+json" if wants_json else "text/html"
             schedule_metadata_enrichment(
                 canonical, passthrough_body, is_json=is_upstream_json, ttl=eff_ttl
@@ -319,22 +327,32 @@ async def simple_project(project: str, request: Request, accept: str | None = He
                 proj.name = canonical
             # cache the upstream JSON with URLs rewritten but all other fields intact
             json_body = rewrite_simple_body(r.text, is_json=True)
-            await cache.setex(f"simple:{canonical}:json", eff_ttl, json_body)
-            await cache.setex(f"simple:{canonical}:json:stale", stale_ttl, json_body)
             html_body = model_to_html(rewrite_project_urls(proj))
-            await cache.setex(f"simple:{canonical}:html", eff_ttl, html_body)
-            await cache.setex(f"simple:{canonical}:html:stale", stale_ttl, html_body)
+            await cache.setex_many(
+                [
+                    *validator_values,
+                    (f"simple:{canonical}:json", eff_ttl, json_body),
+                    (f"simple:{canonical}:json:stale", stale_ttl, json_body),
+                    (f"simple:{canonical}:html", eff_ttl, html_body),
+                    (f"simple:{canonical}:html:stale", stale_ttl, html_body),
+                ]
+            )
             body, out_ct = html_body, "text/html"
         else:
             proj = parse_simple_html(canonical, r.text)
             if not proj.name:
                 proj.name = canonical
             html_body = rewrite_simple_body(r.text, is_json=False)
-            await cache.setex(f"simple:{canonical}:html", eff_ttl, html_body)
-            await cache.setex(f"simple:{canonical}:html:stale", stale_ttl, html_body)
             json_body = json.dumps(model_to_json(rewrite_project_urls(proj)))
-            await cache.setex(f"simple:{canonical}:json", eff_ttl, json_body)
-            await cache.setex(f"simple:{canonical}:json:stale", stale_ttl, json_body)
+            await cache.setex_many(
+                [
+                    *validator_values,
+                    (f"simple:{canonical}:html", eff_ttl, html_body),
+                    (f"simple:{canonical}:html:stale", stale_ttl, html_body),
+                    (f"simple:{canonical}:json", eff_ttl, json_body),
+                    (f"simple:{canonical}:json:stale", stale_ttl, json_body),
+                ]
+            )
             body, out_ct = json_body, "application/vnd.pypi.simple.v1+json"
 
         metrics["synthesis_count"] += 1
