@@ -48,12 +48,19 @@ UPSTREAM_SIMPLE_URL=http://legacy-simple:9000/simple docker compose --profile le
 upstream metadata, it uses bounded range reads to extract `METADATA`, stores it by wheel SHA256,
 and serves it from `wheel-url.metadata`. Set `METADATA_ARTIFACT_BASE_URL` to the nginx base URL
 (for example, `http://nginx`) so those range reads share its artifact cache.
-`METADATA_HEAD_CONCURRENCY` (default 10) and `METADATA_MAX_INFLIGHT_PROJECTS` (default 4)
-bound active work; `METADATA_MAX_PENDING_PROJECTS` (default 16) bounds all scheduled project
-enrichments, including queued work. `METADATA_EXTRACT_CONCURRENCY` (default 2) separately bounds
-background ZIP extraction, while `METADATA_RECOVERY_CONCURRENCY` (default 2) reserves bounded
-request-path capacity so advertised metadata can recover behind a background backlog. To keep
-large project indexes bounded, only the newest
+Native metadata discovery and generated-metadata extraction run in separate phases. HEAD probes
+run first; speculative wheel extraction then waits for
+`METADATA_BACKGROUND_EXTRACTION_IDLE_SECONDS` of project-request inactivity visible to that
+Python process (default `90`; set it to `0` to restore immediate extraction).
+`METADATA_HEAD_CONCURRENCY` (default 10) and
+`METADATA_MAX_INFLIGHT_PROJECTS` (default 4) bound discovery, while
+`METADATA_MAX_PENDING_PROJECTS` (default 16) bounds scheduled discovery work. Delayed jobs retain
+only a project identity and body digest and are independently bounded by
+`METADATA_MAX_PENDING_EXTRACTION_PROJECTS` (default 64) and
+`METADATA_MAX_INFLIGHT_EXTRACTION_PROJECTS` (default 4). `METADATA_EXTRACT_CONCURRENCY` (default 2)
+bounds wheel extraction within those jobs, while `METADATA_RECOVERY_CONCURRENCY` (default 2)
+reserves request-path capacity so advertised metadata can recover regardless of the background
+queue or idle delay. To keep large project indexes bounded, only the newest
 `METADATA_MAX_EXTRACT_FILES_PER_PROJECT` (default 32) parseable wheels missing metadata are
 probed during each project pass. Pending project responses use a one-second outer-cache TTL by
 default to collapse concurrent bursts without hiding enrichment for the full project TTL; set

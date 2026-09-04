@@ -404,6 +404,9 @@ async def test_health_includes_cache_fields(client):
     assert "proxy_metadata_recovery_attempts_total" in body
     assert "proxy_metadata_recovery_successes_total" in body
     assert "proxy_metadata_recovery_failures_total" in body
+    assert "proxy_metadata_discovery_completions_total" in body
+    assert "proxy_metadata_extraction_jobs_queued_total" in body
+    assert "proxy_metadata_extraction_jobs_dropped_total" in body
 
 
 @pytest.mark.asyncio

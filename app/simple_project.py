@@ -15,6 +15,7 @@ from app.config import settings
 from app.deps import get_http_client
 from app.metadata import (
     metadata_response_cache_ttl,
+    note_project_request,
     refresh_metadata_response_readiness,
     schedule_metadata_enrichment,
 )
@@ -132,6 +133,7 @@ async def _try_serve_from_cache(
 @router.get("/simple/{project}/")
 async def simple_project(project: str, request: Request, accept: str | None = Header(default=None)):
     start = time.perf_counter()
+    note_project_request()
     metrics["requests_total"] += 1
     wants_json = accept_wants_json(accept)
     canonical = canonicalize_name(project)

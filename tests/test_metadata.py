@@ -7,14 +7,17 @@ from app.config import settings
 from app.metadata import (
     _artifact_upstream_url,
     _extraction_candidate_indexes,
+    _extraction_pending,
     _pending,
     _probe,
     _safe_url_for_log,
+    cancel_metadata_tasks,
     drain_metadata_tasks,
     load_metadata_for_url,
     metadata_head_url,
     metadata_response_cache_ttl,
     schedule_metadata_enrichment,
+    start_metadata_tasks,
     store_extracted_metadata,
 )
 from app.metrics import metrics
@@ -874,6 +877,251 @@ async def test_same_declared_wheel_sha_is_scoped_to_artifact_url(monkeypatch):
     second_stored = await load_metadata_for_url(second.url)
     assert first_stored is not None and "Version: 1.0" in first_stored[0]
     assert second_stored is not None and "Version: 2.0" in second_stored[0]
+
+
+async def test_native_discovery_finishes_before_delayed_extraction(
+    client, mock_upstream, monkeypatch
+):
+    import asyncio
+
+    import app.metadata as meta
+
+    await drain_metadata_tasks()
+    monkeypatch.setattr(settings, "enable_background_metadata", True)
+    extraction_release = asyncio.Event()
+    extraction_waiting = asyncio.Event()
+    extracted: list[str] = []
+    html = (
+        "<!DOCTYPE html><html><body>"
+        f'<a href="https://files.pythonhosted.org/packages/demo-1.0-py3-none-any.whl'
+        f'#sha256={"a" * 64}">demo-1.0-py3-none-any.whl</a>'
+        "</body></html>"
+    )
+
+    async def wait_for_idle() -> None:
+        extraction_waiting.set()
+        await extraction_release.wait()
+
+    async def extract(url: str) -> bytes:
+        extracted.append(url)
+        return b"Metadata-Version: 2.4\nName: demo\nVersion: 1.0\n"
+
+    recorder = mock_upstream(
+        lambda url, headers=None: Response(200, text=html, headers={"content-type": "text/html"}),
+        head_handler=lambda url, headers=None: Response(404),
+    )
+    monkeypatch.setattr(meta, "_wait_for_extraction_idle", wait_for_idle)
+    monkeypatch.setattr(meta, "_extract_wheel_metadata", extract)
+
+    response = await client.get("/simple/phased/", headers={"Accept": "text/html"})
+    assert response.status_code == 200
+    await asyncio.wait_for(extraction_waiting.wait(), 1)
+
+    assert extracted == []
+    assert len(_extraction_pending) == 1
+    assert len([call for call in recorder.calls if call["method"] == "HEAD"]) == 1
+    assert await meta.metadata_response_cache_ttl("phased", html, is_json=False) is None
+
+    # The exact discovery marker avoids repeating HEAD while extraction waits.
+    await client.get("/simple/phased/", headers={"Accept": "text/html"})
+    await asyncio.sleep(0)
+    assert len([call for call in recorder.calls if call["method"] == "HEAD"]) == 1
+
+    extraction_release.set()
+    await drain_metadata_tasks()
+
+    assert len(extracted) == 1
+    assert len([call for call in recorder.calls if call["method"] == "HEAD"]) == 1
+    enriched = await client.get("/simple/phased/", headers={"Accept": "text/html"})
+    assert 'data-core-metadata="sha256=' in enriched.text
+    assert enriched.headers["cache-control"].startswith("public, max-age=")
+
+
+async def test_native_discovery_needs_no_extraction_job(client, mock_upstream, monkeypatch):
+    import app.metadata as meta
+
+    await drain_metadata_tasks()
+    monkeypatch.setattr(settings, "enable_background_metadata", True)
+    html = (
+        "<!DOCTYPE html><html><body>"
+        f'<a href="https://files.pythonhosted.org/packages/native-1.0-py3-none-any.whl'
+        f'#sha256={"b" * 64}">native-1.0-py3-none-any.whl</a>'
+        "</body></html>"
+    )
+
+    async def unexpected_extract(url: str) -> bytes:
+        raise AssertionError(f"native discovery must not extract {url}")
+
+    mock_upstream(
+        lambda url, headers=None: Response(200, text=html, headers={"content-type": "text/html"}),
+        head_handler=lambda url, headers=None: Response(200),
+    )
+    monkeypatch.setattr(meta, "_extract_wheel_metadata", unexpected_extract)
+
+    await client.get("/simple/native-phase/", headers={"Accept": "text/html"})
+    await drain_metadata_tasks()
+
+    assert _extraction_pending == {}
+    completed = await client.get("/simple/native-phase/", headers={"Accept": "text/html"})
+    assert 'data-core-metadata="true"' in completed.text
+    assert completed.headers["cache-control"].startswith("public, max-age=")
+
+
+async def test_delayed_extraction_queue_coalesces_and_is_independently_bounded(monkeypatch):
+    import asyncio
+
+    import app.metadata as meta
+
+    await drain_metadata_tasks()
+    monkeypatch.setattr(settings, "metadata_max_pending_extraction_projects", 1)
+    release = asyncio.Event()
+
+    async def blocked_idle() -> None:
+        await release.wait()
+
+    monkeypatch.setattr(meta, "_wait_for_extraction_idle", blocked_idle)
+    queued_before = metrics["metadata_extraction_jobs_queued"]
+    coalesced_before = metrics["metadata_extraction_jobs_coalesced"]
+    dropped_before = metrics["metadata_extraction_jobs_dropped"]
+
+    meta._schedule_project_extraction("one", is_json=False, body="same")
+    meta._schedule_project_extraction("one", is_json=False, body="same")
+    meta._schedule_project_extraction("two", is_json=False, body="different")
+    await asyncio.sleep(0)
+
+    assert len(_extraction_pending) == 1
+    assert metrics["metadata_extraction_jobs_queued"] == queued_before + 1
+    assert metrics["metadata_extraction_jobs_coalesced"] == coalesced_before + 1
+    assert metrics["metadata_extraction_jobs_dropped"] == dropped_before + 1
+
+    release.set()
+    await drain_metadata_tasks()
+
+
+async def test_background_tasks_cancel_cleanly(monkeypatch):
+    import asyncio
+
+    import app.metadata as meta
+
+    await drain_metadata_tasks()
+    release = asyncio.Event()
+
+    async def blocked_idle() -> None:
+        await release.wait()
+
+    monkeypatch.setattr(meta, "_wait_for_extraction_idle", blocked_idle)
+    meta._schedule_project_extraction("cancelled", is_json=False, body="body")
+    await asyncio.sleep(0)
+
+    await cancel_metadata_tasks()
+
+    assert _pending == {}
+    assert _extraction_pending == {}
+    start_metadata_tasks()
+
+
+async def test_shutdown_rejects_new_background_work(monkeypatch):
+    import app.metadata as meta
+
+    await cancel_metadata_tasks()
+    monkeypatch.setattr(settings, "enable_background_metadata", True)
+
+    schedule_metadata_enrichment("discovery", "body", is_json=False, ttl=60)
+    meta._schedule_project_extraction("extraction", is_json=False, body="body")
+
+    try:
+        assert _pending == {}
+        assert _extraction_pending == {}
+    finally:
+        start_metadata_tasks()
+
+
+async def test_extraction_idle_wait_uses_configured_project_quiet_period(monkeypatch):
+    import app.metadata as meta
+
+    class FakeLoop:
+        def __init__(self):
+            self.times = iter((10.0, 12.0))
+
+        def time(self) -> float:
+            return next(self.times)
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(settings, "metadata_background_extraction_idle_seconds", 2.0)
+    monkeypatch.setattr(meta, "_last_project_activity", 10.0)
+    monkeypatch.setattr(meta.asyncio, "get_running_loop", lambda: FakeLoop())
+    monkeypatch.setattr(meta.asyncio, "sleep", fake_sleep)
+
+    await meta._wait_for_extraction_idle()
+
+    assert sleeps == [2.0]
+
+
+async def test_delayed_extraction_rechecks_idle_between_batches(monkeypatch):
+    import app.metadata as meta
+
+    monkeypatch.setattr(settings, "metadata_extract_concurrency", 1)
+    body = (
+        "<!DOCTYPE html><html><body>"
+        + "".join(
+            f'<a href="https://files.pythonhosted.org/packages/demo-{version}.0-py3-none-any.whl'
+            f'#sha256={version:064x}">demo-{version}.0-py3-none-any.whl</a>'
+            for version in (1, 2)
+        )
+        + "</body></html>"
+    )
+    await cache.setex("simple:batches:html", 60, body)
+    idle_checks = 0
+
+    async def record_idle_check() -> None:
+        nonlocal idle_checks
+        idle_checks += 1
+
+    async def resolve(file, **kwargs):
+        assert kwargs == {"allow_extraction": True, "check_native": False}
+        return meta._with_core_metadata(file, True)
+
+    monkeypatch.setattr(meta, "_wait_for_extraction_idle", record_idle_check)
+    monkeypatch.setattr(meta, "_probe", resolve)
+
+    await meta._extract_project_after_idle(
+        "batches", is_json=False, body_digest=meta._body_digest(body)
+    )
+
+    # Once before and once after worker admission, then before each wheel batch.
+    assert idle_checks == 4
+
+
+async def test_ready_hits_and_404s_record_project_activity(client, mock_upstream, monkeypatch):
+    import app.metadata as meta
+
+    monkeypatch.setattr(settings, "enable_background_metadata", True)
+    body = "<!DOCTYPE html><html><body></body></html>"
+    await cache.setex("simple:activity:html", 60, body)
+    await cache.setex(
+        meta._project_ready_key("activity", is_json=False),
+        60,
+        meta._body_digest(body),
+    )
+    monkeypatch.setattr(meta, "_last_project_activity", 0.0)
+
+    ready = await client.get("/simple/activity/", headers={"Accept": "text/html"})
+
+    assert ready.status_code == 200
+    assert meta._last_project_activity > 0
+
+    cache._mem.clear()
+    mock_upstream(lambda url, headers=None: Response(404))
+    monkeypatch.setattr(meta, "_last_project_activity", 0.0)
+
+    missing = await client.get("/simple/missing-activity/", headers={"Accept": "text/html"})
+
+    assert missing.status_code == 404
+    assert meta._last_project_activity > 0
 
 
 async def test_enrichment_schedule_has_hard_pending_bound(monkeypatch):

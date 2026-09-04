@@ -40,6 +40,12 @@ _recovery_extract_semaphore = asyncio.Semaphore(settings.metadata_recovery_concu
 # lets a miss storm spawn unbounded background work with no back-pressure.
 _task_semaphore = asyncio.Semaphore(settings.metadata_max_inflight_projects)
 _pending: dict[str, asyncio.Task] = {}
+_extraction_project_semaphore = asyncio.Semaphore(
+    settings.metadata_max_inflight_extraction_projects
+)
+_extraction_pending: dict[tuple[str, bool, str], asyncio.Task] = {}
+_last_project_activity = 0.0
+_closing = False
 
 
 def _scheme_for(host: str) -> str:
@@ -136,6 +142,11 @@ def _metadata_fill_lock_key(file_url: str) -> str:
 def _project_ready_key(canonical: str, *, is_json: bool) -> str:
     output_format = "json" if is_json else "html"
     return f"simple:{canonical}:{output_format}:metadata-ready"
+
+
+def _project_discovered_key(canonical: str, *, is_json: bool) -> str:
+    output_format = "json" if is_json else "html"
+    return f"simple:{canonical}:{output_format}:metadata-discovered"
 
 
 def _body_digest(body: str) -> str:
@@ -302,6 +313,7 @@ async def _resolve_metadata_for_url(
     *,
     wheel_sha256: str | None,
     allow_extraction: bool,
+    check_native: bool = True,
     recovery: bool = False,
 ) -> _MetadataResolution | None:
     stored = await _load_metadata_bounded(
@@ -323,29 +335,30 @@ async def _resolve_metadata_for_url(
         if recovery:
             metrics["metadata_recovery_attempts"] += 1
 
-        native_url = metadata_head_url(file_url)
-        if native_url is None:
-            if recovery:
-                metrics["metadata_recovery_failures"] += 1
-            return None
-        async with _probe_semaphore:
-            try:
-                response = await asyncio.wait_for(
-                    get_http_client().head(native_url, follow_redirects=False),
-                    timeout=_HEAD_TIMEOUT,
-                )
-            except Exception:
-                logger.debug(
-                    "metadata HEAD failed for %s",
-                    _safe_url_for_log(native_url),
-                    exc_info=True,
-                )
-                response = None
-        metrics["metadata_heads"] += 1
-        if response is not None and response.status_code == 200:
-            if recovery:
-                metrics["metadata_recovery_native_fallbacks"] += 1
-            return _MetadataResolution(native=True)
+        if check_native:
+            native_url = metadata_head_url(file_url)
+            if native_url is None:
+                if recovery:
+                    metrics["metadata_recovery_failures"] += 1
+                return None
+            async with _probe_semaphore:
+                try:
+                    response = await asyncio.wait_for(
+                        get_http_client().head(native_url, follow_redirects=False),
+                        timeout=_HEAD_TIMEOUT,
+                    )
+                except Exception:
+                    logger.debug(
+                        "metadata HEAD failed for %s",
+                        _safe_url_for_log(native_url),
+                        exc_info=True,
+                    )
+                    response = None
+            metrics["metadata_heads"] += 1
+            if response is not None and response.status_code == 200:
+                if recovery:
+                    metrics["metadata_recovery_native_fallbacks"] += 1
+                return _MetadataResolution(native=True)
         if not allow_extraction:
             return None
 
@@ -411,8 +424,9 @@ async def load_or_recover_metadata_for_url(file_url: str) -> tuple[str, str] | N
 
 
 def schedule_metadata_enrichment(canonical: str, body: str, *, is_json: bool, ttl: int) -> None:
-    if not settings.enable_background_metadata:
+    if not settings.enable_background_metadata or _closing:
         return
+    note_project_request()
     canonical = canonicalize_name(canonical)
     existing = _pending.get(canonical)
     if existing is not None and not existing.done():
@@ -431,10 +445,54 @@ def schedule_metadata_enrichment(canonical: str, body: str, *, is_json: bool, tt
     task.add_done_callback(remove_if_current)
 
 
+def note_project_request() -> None:
+    """Record project traffic visible to Python for the background idle gate."""
+    global _last_project_activity
+    if settings.enable_background_metadata:
+        _last_project_activity = asyncio.get_running_loop().time()
+
+
 async def drain_metadata_tasks() -> None:
     """Wait for in-flight enrichment tasks (tests)."""
-    while _pending:
-        await asyncio.gather(*list(_pending.values()), return_exceptions=True)
+    while _pending or _extraction_pending:
+        discovery_tasks = list(_pending.items())
+        extraction_tasks = list(_extraction_pending.items())
+        await asyncio.gather(
+            *(task for _, task in discovery_tasks),
+            *(task for _, task in extraction_tasks),
+            return_exceptions=True,
+        )
+        for key, task in discovery_tasks:
+            if task.done() and _pending.get(key) is task:
+                _pending.pop(key, None)
+        for key, task in extraction_tasks:
+            if task.done() and _extraction_pending.get(key) is task:
+                _extraction_pending.pop(key, None)
+
+
+async def cancel_metadata_tasks() -> None:
+    """Cancel queued background work during application shutdown."""
+    global _closing
+    _closing = True
+    while _pending or _extraction_pending:
+        tasks = {*_pending.values(), *_extraction_pending.values()}
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for key, task in list(_pending.items()):
+            if task.done():
+                _pending.pop(key, None)
+        for key, task in list(_extraction_pending.items()):
+            if task.done():
+                _extraction_pending.pop(key, None)
+    _pending.clear()
+    _extraction_pending.clear()
+
+
+def start_metadata_tasks() -> None:
+    """Allow background work when a new application lifespan starts."""
+    global _closing
+    _closing = False
 
 
 def _needs_probe(f: File) -> bool:
@@ -447,7 +505,7 @@ def _needs_probe(f: File) -> bool:
     )
 
 
-async def _probe(f: File, *, allow_extraction: bool = True) -> File:
+async def _probe(f: File, *, allow_extraction: bool = True, check_native: bool = True) -> File:
     if not _needs_probe(f):
         return f
     wheel_sha256 = f.hashes.get("sha256", "").lower()
@@ -456,6 +514,7 @@ async def _probe(f: File, *, allow_extraction: bool = True) -> File:
         f.url,
         wheel_sha256=wheel_sha256 if can_extract else None,
         allow_extraction=can_extract and allow_extraction,
+        check_native=check_native,
     )
     if resolved is None:
         return f
@@ -525,69 +584,215 @@ def _extraction_candidate_indexes(files: list[File]) -> set[int]:
     return {index for _, index in ranked[:limit]}
 
 
+def _parse_project_body(canonical: str, body: str, *, is_json: bool):
+    proj = parse_simple_json(json.loads(body)) if is_json else parse_simple_html(canonical, body)
+    if not proj.name:
+        proj.name = canonical
+    return proj
+
+
+def _can_extract(file: File) -> bool:
+    wheel_sha256 = file.hashes.get("sha256", "").lower()
+    return file.filename.lower().endswith(".whl") and bool(_SHA256_RE.fullmatch(wheel_sha256))
+
+
+async def _commit_project_enrichment(
+    canonical: str,
+    body: str,
+    *,
+    is_json: bool,
+    files: list[File],
+    changed: bool,
+    ready: bool,
+) -> str | None:
+    """CAS one project representation and its body-bound phase markers."""
+    stale = settings.cache_stale_ttl_seconds
+    source_key = f"simple:{canonical}:{'json' if is_json else 'html'}"
+    completed_body = (
+        await asyncio.to_thread(_advertise_metadata, body, is_json=is_json, files=files)
+        if changed
+        else body
+    )
+
+    async with miss_locks.hold(f"simple:{canonical}:fill"):
+        if await cache.get(source_key) != body:
+            logger.debug("skipping stale enrichment for %s", canonical)
+            return None
+        remaining_ttl = await cache.ttl(source_key)
+        if remaining_ttl is None:
+            logger.debug("skipping expired enrichment for %s", canonical)
+            return None
+
+        marker_ttl = max(stale, remaining_ttl)
+        digest = _body_digest(completed_body)
+        writes: list[tuple[str, int, str]] = []
+        if changed:
+            writes.extend(
+                (
+                    (source_key, remaining_ttl, completed_body),
+                    (f"{source_key}:stale", stale, completed_body),
+                )
+            )
+        writes.append((_project_discovered_key(canonical, is_json=is_json), remaining_ttl, digest))
+        if ready:
+            writes.append((_project_ready_key(canonical, is_json=is_json), marker_ttl, digest))
+        committed = await cache.setex_many_if_unchanged({source_key: body}, writes)
+        if not committed:
+            return None
+        if changed:
+            metrics["metadata_enrichments"] += 1
+        return completed_body
+
+
+async def _wait_for_extraction_idle() -> None:
+    loop = asyncio.get_running_loop()
+    while True:
+        remaining = (
+            _last_project_activity
+            + settings.metadata_background_extraction_idle_seconds
+            - loop.time()
+        )
+        if remaining <= 0:
+            return
+        await asyncio.sleep(remaining)
+
+
+def _schedule_project_extraction(canonical: str, *, is_json: bool, body: str) -> None:
+    if _closing:
+        return
+    digest = _body_digest(body)
+    key = (canonical, is_json, digest)
+    existing = _extraction_pending.get(key)
+    if existing is not None and not existing.done():
+        metrics["metadata_extraction_jobs_coalesced"] += 1
+        return
+    if len(_extraction_pending) >= max(0, settings.metadata_max_pending_extraction_projects):
+        metrics["metadata_extraction_jobs_dropped"] += 1
+        logger.warning("metadata extraction queue full; dropping %s", canonical)
+        return
+    task = asyncio.create_task(
+        _extract_project_after_idle(canonical, is_json=is_json, body_digest=digest)
+    )
+    _extraction_pending[key] = task
+    metrics["metadata_extraction_jobs_queued"] += 1
+
+    def remove_if_current(done: asyncio.Task) -> None:
+        if _extraction_pending.get(key) is done:
+            _extraction_pending.pop(key, None)
+
+    task.add_done_callback(remove_if_current)
+
+
+async def _extract_project_after_idle(canonical: str, *, is_json: bool, body_digest: str) -> None:
+    try:
+        await _wait_for_extraction_idle()
+        async with _extraction_project_semaphore:
+            # Activity may have resumed while this job waited for a worker.
+            await _wait_for_extraction_idle()
+            source_key = f"simple:{canonical}:{'json' if is_json else 'html'}"
+            current, stale = await cache.get_many([source_key, f"{source_key}:stale"])
+            if current is not None and _body_digest(current) == body_digest:
+                body = current
+                can_publish = True
+            elif stale is not None and _body_digest(stale) == body_digest:
+                # Metadata content is immutable and still useful to the next fill,
+                # but an expired body must never be republished as current.
+                body = stale
+                can_publish = False
+            else:
+                metrics["metadata_extraction_jobs_stale"] += 1
+                return
+
+            proj = await asyncio.to_thread(_parse_project_body, canonical, body, is_json=is_json)
+            candidate_indexes = sorted(_extraction_candidate_indexes(proj.files))
+            new_files = list(proj.files)
+            batch_size = max(1, settings.metadata_extract_concurrency)
+            for offset in range(0, len(candidate_indexes), batch_size):
+                await _wait_for_extraction_idle()
+                batch_indexes = candidate_indexes[offset : offset + batch_size]
+                probed_files = await asyncio.gather(
+                    *(
+                        _probe(
+                            proj.files[index],
+                            allow_extraction=True,
+                            check_native=False,
+                        )
+                        for index in batch_indexes
+                    )
+                )
+                for index, probed_file in zip(batch_indexes, probed_files, strict=True):
+                    new_files[index] = probed_file
+            changed = any(
+                not _needs_probe(new_file) and _needs_probe(old_file)
+                for new_file, old_file in zip(new_files, proj.files, strict=True)
+            )
+            if can_publish:
+                await _commit_project_enrichment(
+                    canonical,
+                    body,
+                    is_json=is_json,
+                    files=new_files,
+                    changed=changed,
+                    ready=True,
+                )
+            metrics["metadata_extraction_jobs_completed"] += 1
+    except Exception:
+        logger.exception("delayed metadata extraction failed for %s", canonical)
+
+
 async def _enrich(canonical: str, body: str, *, is_json: bool, ttl: int) -> None:
+    del ttl  # The exact remaining cache lifetime is sampled immediately before CAS.
     try:
         async with _task_semaphore:
-            if is_json:
-                proj = parse_simple_json(json.loads(body))
-            else:
-                proj = parse_simple_html(canonical, body)
-            if not proj.name:
-                proj.name = canonical
+            proj = await asyncio.to_thread(_parse_project_body, canonical, body, is_json=is_json)
+            candidate_indexes = sorted(_extraction_candidate_indexes(proj.files))
+            digest = _body_digest(body)
+            discovered = await cache.get(_project_discovered_key(canonical, is_json=is_json))
 
-            extraction_candidates = _extraction_candidate_indexes(proj.files)
+            if discovered == digest:
+                if any(_can_extract(proj.files[index]) for index in candidate_indexes):
+                    _schedule_project_extraction(canonical, is_json=is_json, body=body)
+                else:
+                    await _commit_project_enrichment(
+                        canonical,
+                        body,
+                        is_json=is_json,
+                        files=list(proj.files),
+                        changed=False,
+                        ready=True,
+                    )
+                return
+
             new_files = list(proj.files)
-            candidate_indexes = sorted(extraction_candidates)
             probed_files = await asyncio.gather(
-                *(_probe(proj.files[index]) for index in candidate_indexes)
+                *(_probe(proj.files[index], allow_extraction=False) for index in candidate_indexes)
             )
             for index, probed_file in zip(candidate_indexes, probed_files, strict=True):
                 new_files[index] = probed_file
             changed = any(
-                not _needs_probe(nf) and _needs_probe(of)
-                for nf, of in zip(new_files, proj.files, strict=True)
+                not _needs_probe(new_file) and _needs_probe(old_file)
+                for new_file, old_file in zip(new_files, proj.files, strict=True)
             )
-            stale = settings.cache_stale_ttl_seconds
-            source_key = f"simple:{canonical}:{'json' if is_json else 'html'}"
-
-            # Probing is slow, so a normal refill may have replaced the entry we
-            # started from. Take the project's fill lock and re-check before
-            # writing, so a stale enrichment cannot clobber a newer body.
-            async with miss_locks.hold(f"simple:{canonical}:fill"):
-                if await cache.get(source_key) != body:
-                    logger.debug("skipping stale enrichment for %s", canonical)
-                    return
-                remaining_ttl = await cache.ttl(source_key)
-                if remaining_ttl is None:
-                    logger.debug("skipping expired enrichment for %s", canonical)
-                    return
-                completed_body = (
-                    _advertise_metadata(body, is_json=is_json, files=new_files) if changed else body
+            needs_extraction = any(
+                _needs_probe(new_files[index]) and _can_extract(new_files[index])
+                for index in candidate_indexes
+            )
+            completed_body = await _commit_project_enrichment(
+                canonical,
+                body,
+                is_json=is_json,
+                files=new_files,
+                changed=changed,
+                ready=not needs_extraction,
+            )
+            if completed_body is None:
+                return
+            metrics["metadata_discovery_completions"] += 1
+            if needs_extraction:
+                _schedule_project_extraction(
+                    canonical,
+                    is_json=is_json,
+                    body=completed_body,
                 )
-
-                # Commit only the representation that was actually probed, then
-                # publish its body-bound marker in the same compare-and-set. The
-                # opposite representation may belong to a concurrent upstream fill.
-                marker_ttl = max(stale, remaining_ttl)
-                writes: list[tuple[str, int, str]] = []
-                if changed:
-                    # Reuse the TTL the response was cached under; recomputing from the
-                    # default would extend an upstream max-age we already honoured.
-                    writes.extend(
-                        (
-                            (source_key, remaining_ttl, completed_body),
-                            (f"{source_key}:stale", stale, completed_body),
-                        )
-                    )
-                writes.append(
-                    (
-                        _project_ready_key(canonical, is_json=is_json),
-                        marker_ttl,
-                        _body_digest(completed_body),
-                    )
-                )
-                committed = await cache.setex_many_if_unchanged({source_key: body}, writes)
-                if committed and changed:
-                    metrics["metadata_enrichments"] += 1
     except Exception:
-        logger.exception("background metadata enrichment failed for %s", canonical)
+        logger.exception("background metadata discovery failed for %s", canonical)
