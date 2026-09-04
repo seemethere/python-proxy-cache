@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     metadata_max_inflight_projects: int = 4
     # Hard bound on scheduled enrichment tasks (running plus queued).
     metadata_max_pending_projects: int = 16
+    # Wait for this much project-request inactivity observed by this process
+    # before speculative wheel extraction. Zero restores immediate behavior.
+    metadata_background_extraction_idle_seconds: float = Field(default=90.0, ge=0)
+    # Delayed extraction retains only a project identity and body digest, not the
+    # potentially large Simple response.
+    metadata_max_pending_extraction_projects: int = Field(default=64, ge=0)
+    metadata_max_inflight_extraction_projects: int = Field(default=4, ge=1)
     metadata_extract_concurrency: int = 2
     # Reserved request-path extraction capacity. Keeping it separate prevents a
     # speculative enrichment backlog from starving an advertised metadata URL.

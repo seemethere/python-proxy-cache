@@ -9,6 +9,7 @@ from fastapi.responses import PlainTextResponse
 
 from app.cache import CacheState, cache
 from app.config import settings
+from app.metadata import cancel_metadata_tasks, start_metadata_tasks
 from app.metadata_route import router as metadata_router
 from app.metrics import metrics, prometheus_text
 from app.simple_index import router as simple_index_router
@@ -27,9 +28,13 @@ async def lifespan(app: FastAPI):
         headers={"User-Agent": "python-proxy-cache/0.1"},
     )
     await cache.connect()
-    yield
-    if http_client:
-        await http_client.aclose()
+    start_metadata_tasks()
+    try:
+        yield
+    finally:
+        await cancel_metadata_tasks()
+        if http_client:
+            await http_client.aclose()
 
 
 app = FastAPI(title="python-proxy-cache", lifespan=lifespan)
