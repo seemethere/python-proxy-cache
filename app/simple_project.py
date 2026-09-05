@@ -8,12 +8,14 @@ import httpx
 from fastapi import APIRouter, Header, HTTPException, Request, Response
 from packaging.utils import canonicalize_name
 
+from app.accept import accepts_html
 from app.accept import want_json as accept_wants_json
 from app.artifacts import rewrite_project_urls, rewrite_simple_body
 from app.cache import cache
 from app.config import settings
 from app.deps import get_http_client
 from app.metadata import (
+    ensure_metadata_background_work,
     metadata_response_cache_ttl,
     note_project_request,
     refresh_metadata_response_readiness,
@@ -44,10 +46,7 @@ async def _cached_response(
         if cache_ttl is not None:
             headers["Cache-Control"] = f"public, max-age={cache_ttl}"
         else:
-            output_format = "json" if wants_json else "html"
-            body_ttl = await cache.ttl(f"simple:{canonical}:{output_format}")
-            if body_ttl is not None:
-                schedule_metadata_enrichment(canonical, body, is_json=wants_json, ttl=body_ttl)
+            await ensure_metadata_background_work(canonical, body, is_json=wants_json)
     return Response(
         body,
         media_type=ct,
@@ -56,7 +55,13 @@ async def _cached_response(
 
 
 async def _try_serve_from_cache(
-    *, canonical: str, cache_key: str, other_key: str, wants_json: bool, start: float
+    *,
+    canonical: str,
+    cache_key: str,
+    other_key: str,
+    wants_json: bool,
+    allow_html_passthrough: bool,
+    start: float,
 ) -> Response | None:
     """Serve from the negative cache, the primary key, or the opposite format.
 
@@ -84,6 +89,14 @@ async def _try_serve_from_cache(
     # This keeps the common exact-format HIT to one body transfer from Redis.
     other_cached = await cache.get(other_key)
     if other_cached:
+        if wants_json and allow_html_passthrough:
+            metrics["cache_hits"] += 1
+            return await _cached_response(
+                other_cached,
+                wants_json=False,
+                canonical=canonical,
+                start=start,
+            )
         try:
             if wants_json:
                 proj = parse_simple_html(canonical, other_cached)
@@ -136,6 +149,7 @@ async def simple_project(project: str, request: Request, accept: str | None = He
     note_project_request()
     metrics["requests_total"] += 1
     wants_json = accept_wants_json(accept)
+    allow_html_passthrough = accepts_html(accept)
     canonical = canonicalize_name(project)
     # also handle non-canonical cache alias
     cache_key = f"simple:{canonical}:{'json' if wants_json else 'html'}"
@@ -149,6 +163,7 @@ async def simple_project(project: str, request: Request, accept: str | None = He
         "cache_key": cache_key,
         "other_key": other_key,
         "wants_json": wants_json,
+        "allow_html_passthrough": allow_html_passthrough,
         "start": start,
     }
     if (hit := await _try_serve_from_cache(**serve_args)) is not None:
@@ -200,22 +215,29 @@ async def simple_project(project: str, request: Request, accept: str | None = He
 
         # 304 Not Modified — revalidate stale body
         if r.status_code == 304:
+            response_wants_json = wants_json
+            response_cache_key = cache_key
             stale_body, other_stale = await cache.get_many(
                 [f"{cache_key}:stale", f"{other_key}:stale"]
             )
             # Fallback: try the opposite stale representation and synthesize.
             if stale_body is None and other_stale is not None:
-                try:
-                    if wants_json:
-                        proj = parse_simple_html(canonical, other_stale)
-                        stale_body = json.dumps(model_to_json(rewrite_project_urls(proj)))
-                    else:
-                        proj = parse_simple_json(json.loads(other_stale))
-                        stale_body = model_to_html(rewrite_project_urls(proj))
-                    # cache synthesized stale as well
-                    await cache.setex(f"{other_key}:stale", stale_ttl, other_stale)
-                except (ValueError, TypeError, KeyError):
-                    stale_body = None
+                if wants_json and allow_html_passthrough:
+                    stale_body = other_stale
+                    response_wants_json = False
+                    response_cache_key = other_key
+                else:
+                    try:
+                        if wants_json:
+                            proj = parse_simple_html(canonical, other_stale)
+                            stale_body = json.dumps(model_to_json(rewrite_project_urls(proj)))
+                        else:
+                            proj = parse_simple_json(json.loads(other_stale))
+                            stale_body = model_to_html(rewrite_project_urls(proj))
+                        # cache synthesized stale as well
+                        await cache.setex(f"{other_key}:stale", stale_ttl, other_stale)
+                    except (ValueError, TypeError, KeyError):
+                        stale_body = None
             if stale_body is None:
                 # Stale copy vanished between the have_stale check and now (TTL expiry or
                 # eviction). Drop the validators and refetch unconditionally rather than
@@ -235,22 +257,25 @@ async def simple_project(project: str, request: Request, accept: str | None = He
             else:
                 # effective TTL respects upstream Cache-Control if present on 304
                 eff_ttl = effective_project_ttl(r.headers)
-                refreshed_values = [(cache_key, eff_ttl, stale_body)]
+                refreshed_values = [(response_cache_key, eff_ttl, stale_body)]
                 if etag:
                     refreshed_values.append((etag_key, stale_ttl, etag))
                 if last_mod:
                     refreshed_values.append((lastmod_key, stale_ttl, last_mod))
-                if other_stale:
+                if other_stale and response_cache_key != other_key:
                     refreshed_values.append((other_key, eff_ttl, other_stale))
                 await cache.setex_many(refreshed_values)
                 if settings.enable_background_metadata:
                     await refresh_metadata_response_readiness(
-                        canonical, stale_body, is_json=wants_json, ttl=eff_ttl
+                        canonical, stale_body, is_json=response_wants_json, ttl=eff_ttl
                     )
                 metrics["cache_hits"] += 1
                 metrics["upstream_fetches"] += 1
                 response = await _cached_response(
-                    stale_body, wants_json=wants_json, canonical=canonical, start=start
+                    stale_body,
+                    wants_json=response_wants_json,
+                    canonical=canonical,
+                    start=start,
                 )
                 response.headers["X-Cache"] = "REVALIDATED"
                 response.headers["Server-Timing"] = (
@@ -286,7 +311,7 @@ async def simple_project(project: str, request: Request, accept: str | None = He
         # --- Passthrough path: upstream already has what client wants ---
         # Store verbatim body for the matching format to avoid re-serialization loss (preserves PEP 700+ fields, whitespace, order)
         # and synthesize the opposite format only if a later client requests it.
-        if is_upstream_json == wants_json:
+        if is_upstream_json == wants_json or (not is_upstream_json and allow_html_passthrough):
             # perfect match — cache verbatim and synthesize opposite lazily
             # URL rewrite only — every other upstream field (PEP 700 versions,
             # PEP 708 meta.tracks/alternate-locations, PEP 740 provenance, ordering,
@@ -294,14 +319,15 @@ async def simple_project(project: str, request: Request, accept: str | None = He
             passthrough_body = rewrite_simple_body(r.text, is_json=is_upstream_json)
             # Store only what this request needs. The opposite representation is
             # synthesized lazily by _try_serve_from_cache if a client asks for it.
+            passthrough_key = f"simple:{canonical}:{'json' if is_upstream_json else 'html'}"
             await cache.setex_many(
                 [
                     *validator_values,
-                    (cache_key, eff_ttl, passthrough_body),
-                    (f"{cache_key}:stale", stale_ttl, passthrough_body),
+                    (passthrough_key, eff_ttl, passthrough_body),
+                    (f"{passthrough_key}:stale", stale_ttl, passthrough_body),
                 ]
             )
-            out_ct = "application/vnd.pypi.simple.v1+json" if wants_json else "text/html"
+            out_ct = "application/vnd.pypi.simple.v1+json" if is_upstream_json else "text/html"
             schedule_metadata_enrichment(
                 canonical, passthrough_body, is_json=is_upstream_json, ttl=eff_ttl
             )

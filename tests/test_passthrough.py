@@ -120,3 +120,32 @@ async def test_passthrough_html_upstream_html_client(client, mock_upstream):
     assert "HIT" in r2.headers.get("x-cache", "")
     assert recorder.call_count == 1
     assert await cache.get("simple:requests:json") == r2.text
+
+
+async def test_passthrough_html_when_json_preferring_client_also_accepts_html(
+    client, mock_upstream
+):
+    html = (
+        "<!DOCTYPE html><html><body>"
+        '<a href="https://files.pythonhosted.org/packages/a.whl#sha256=abc">a.whl</a>'
+        "</body></html>"
+    )
+    recorder = mock_upstream(
+        lambda url, headers=None: Response(200, text=html, headers={"content-type": "text/html"})
+    )
+    accept = (
+        "application/vnd.pypi.simple.v1+json, "
+        "application/vnd.pypi.simple.v1+html;q=0.1, text/html;q=0.01"
+    )
+
+    cold = await client.get("/simple/requests/", headers={"Accept": accept})
+    warm = await client.get("/simple/requests/", headers={"Accept": accept})
+
+    assert cold.headers["content-type"].startswith("text/html")
+    assert cold.headers["x-synthesis"] == "0"
+    assert warm.headers["content-type"].startswith("text/html")
+    assert warm.headers["x-cache"] == "HIT"
+    assert warm.headers["x-synthesis"] == "0"
+    assert recorder.call_count == 1
+    assert await cache.get("simple:requests:html") is not None
+    assert await cache.get("simple:requests:json") is None

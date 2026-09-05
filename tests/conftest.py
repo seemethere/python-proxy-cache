@@ -7,6 +7,7 @@ os.environ.setdefault("CACHE_BACKEND", "memory")
 # Production defers speculative extraction by default. Unit tests explicitly
 # exercise the idle gate and otherwise keep legacy immediate timing.
 os.environ.setdefault("METADATA_BACKGROUND_EXTRACTION_IDLE_SECONDS", "0")
+os.environ.setdefault("METADATA_BACKGROUND_DISCOVERY_IDLE_SECONDS", "0")
 
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field

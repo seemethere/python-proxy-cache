@@ -7,7 +7,14 @@ from urllib.parse import urljoin, urlparse
 from app.config import settings
 from app.models import File, Project
 
-_ATTR_RE = re.compile(r"(?P<attr>href)\s*=\s*(?P<quote>[\"'])(?P<url>[^\"']*)(?P=quote)")
+_ATTR_RE = re.compile(
+    r"(?P<attr>href)\s*=\s*(?P<quote>[\"'])(?P<url>[^\"']*)(?P=quote)", re.IGNORECASE
+)
+_ANCHOR_RE = re.compile(r"<a\b[^>]*>", re.IGNORECASE)
+_METADATA_ATTR_RE = re.compile(
+    r"data-(?:core|dist-info)-metadata\s*=\s*(?P<quote>[\"'])(?P<value>[^\"']*)(?P=quote)",
+    re.IGNORECASE,
+)
 
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
@@ -74,7 +81,11 @@ def rewrite_project_urls(project: Project) -> Project:
         files.append(
             File(
                 filename=f.filename,
-                url=rewrite_file_url(f.url),
+                url=(
+                    rewrite_file_url(f.url)
+                    if settings.rewrite_artifact_urls or _file_advertises_metadata(f)
+                    else f.url
+                ),
                 hashes=f.hashes,
                 requires_python=f.requires_python,
                 yanked=f.yanked,
@@ -95,11 +106,21 @@ def rewrite_json_body(body: str) -> str:
     PEP 700 ``versions``, PEP 708 ``meta.tracks`` / ``alternate-locations`` and
     PEP 740 ``provenance``, and rewrites ``meta`` to a hardcoded api-version.
     """
+    if (
+        not settings.rewrite_artifact_urls
+        and '"core-metadata"' not in body
+        and '"dist-info-metadata"' not in body
+    ):
+        return body
     data = json.loads(body)
     files = data.get("files")
     if isinstance(files, list):
         for entry in files:
-            if isinstance(entry, dict) and isinstance(entry.get("url"), str):
+            if (
+                isinstance(entry, dict)
+                and isinstance(entry.get("url"), str)
+                and (settings.rewrite_artifact_urls or _json_entry_advertises_metadata(entry))
+            ):
                 entry["url"] = rewrite_file_url(entry["url"])
     return json.dumps(data)
 
@@ -111,14 +132,44 @@ def rewrite_html_body(body: str) -> str:
     any element we do not model survive untouched.
     """
 
-    def _sub(m: re.Match[str]) -> str:
+    if not settings.rewrite_artifact_urls and _METADATA_ATTR_RE.search(body) is None:
+        return body
+
+    def _rewrite_href(m: re.Match[str]) -> str:
         rewritten = rewrite_file_url(m.group("url"))
         if rewritten == m.group("url"):
             return m.group(0)
         quote = m.group("quote")
         return f"{m.group('attr')}={quote}{rewritten}{quote}"
 
-    return _ATTR_RE.sub(_sub, body)
+    def _rewrite_anchor(m: re.Match[str]) -> str:
+        anchor = m.group(0)
+        if not settings.rewrite_artifact_urls:
+            advertised = any(
+                metadata.group("value").strip().lower() not in ("", "false")
+                for metadata in _METADATA_ATTR_RE.finditer(anchor)
+            )
+            if not advertised:
+                return anchor
+        return _ATTR_RE.sub(_rewrite_href, anchor, count=1)
+
+    return _ANCHOR_RE.sub(_rewrite_anchor, body)
+
+
+def _metadata_value_advertised(value: object) -> bool:
+    return value is True or isinstance(value, (str, dict))
+
+
+def _file_advertises_metadata(file: File) -> bool:
+    return _metadata_value_advertised(file.core_metadata) or _metadata_value_advertised(
+        file.dist_info_metadata
+    )
+
+
+def _json_entry_advertises_metadata(entry: dict) -> bool:
+    return _metadata_value_advertised(entry.get("core-metadata")) or _metadata_value_advertised(
+        entry.get("dist-info-metadata")
+    )
 
 
 def rewrite_simple_body(body: str, *, is_json: bool, project_name: str = "") -> str:
