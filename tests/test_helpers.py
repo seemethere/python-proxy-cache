@@ -1,6 +1,6 @@
 import pytest
 
-from app.accept import CONTENT_TYPE_JSON, want_json
+from app.accept import CONTENT_TYPE_JSON, accepts_html, want_json
 from app.config import settings
 from app.ttl import MIN_UPSTREAM_TTL_SECONDS, effective_project_ttl, parse_max_age
 
@@ -26,6 +26,25 @@ from app.ttl import MIN_UPSTREAM_TTL_SECONDS, effective_project_ttl, parse_max_a
 )
 def test_want_json(accept, expected):
     assert want_json(accept) is expected
+
+
+@pytest.mark.parametrize(
+    ("accept", "expected"),
+    [
+        (None, True),
+        ("", True),
+        ("text/html", True),
+        ("application/vnd.pypi.simple.v1+html;q=0.1", False),
+        ("text/*", True),
+        ("*/*", True),
+        ("text/html;q=0", False),
+        ("text/html;q=0, */*;q=1", False),
+        (CONTENT_TYPE_JSON, False),
+        (f"{CONTENT_TYPE_JSON}, text/html;q=0.01", True),
+    ],
+)
+def test_accepts_html(accept, expected):
+    assert accepts_html(accept) is expected
 
 
 @pytest.mark.parametrize(

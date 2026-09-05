@@ -29,7 +29,16 @@ pip install --index-url http://localhost:8080/simple/ --trusted-host localhost r
 
 Env vars: `UPSTREAM_SIMPLE_URL` (default `https://pypi.org/simple`), `UPSTREAM_FILES_URL`
 (default `https://files.pythonhosted.org`), `ARTIFACT_HOST_ALLOWLIST` (comma-separated extra
-hosts for `/artifacts/` rewrite; keep `nginx/nginx.conf` `map $artifact_host` in sync), `REDIS_URL`, `CACHE_BACKEND`, `CACHE_TTL_SECONDS`.
+hosts for `/artifacts/` rewrite; keep `nginx/nginx.conf` `map $artifact_host` in sync),
+`REWRITE_ARTIFACT_URLS` (default `true`), `REDIS_URL`, `CACHE_BACKEND`, `CACHE_TTL_SECONDS`.
+Set `REWRITE_ARTIFACT_URLS=false` to leave ordinary artifact downloads pointed at the upstream
+host. Links advertising metadata are still rewritten because generated `.metadata` responses
+are served by this proxy.
+
+`METADATA_PENDING_CACHE_TTL_SECONDS` defaults to 30 seconds. This collapses an active resolver
+burst in the outer cache while background metadata discovery waits for its idle window.
+When a client advertises both JSON and `text/html`, an upstream HTML response is passed through
+instead of being parsed and synthesized as JSON; JSON-only clients still receive JSON.
 
 With `CACHE_BACKEND=redis_required`, startup waits for Redis for a bounded number of attempts
 before exiting. `REDIS_STARTUP_MAX_ATTEMPTS` (default 30) sets the total number of connection
@@ -49,9 +58,10 @@ upstream metadata, it uses bounded range reads to extract `METADATA`, stores it 
 and serves it from `wheel-url.metadata`. Set `METADATA_ARTIFACT_BASE_URL` to the nginx base URL
 (for example, `http://nginx`) so those range reads share its artifact cache.
 Native metadata discovery and generated-metadata extraction run in separate phases. HEAD probes
-run first; speculative wheel extraction then waits for
-`METADATA_BACKGROUND_EXTRACTION_IDLE_SECONDS` of project-request inactivity visible to that
-Python process (default `90`; set it to `0` to restore immediate extraction).
+wait for `METADATA_BACKGROUND_DISCOVERY_IDLE_SECONDS` of project-request inactivity visible to
+that Python process (default `90`), then speculative wheel extraction independently waits for
+`METADATA_BACKGROUND_EXTRACTION_IDLE_SECONDS` (also default `90`). Set either value to `0` to
+restore immediate work for that phase.
 `METADATA_HEAD_CONCURRENCY` (default 10) and
 `METADATA_MAX_INFLIGHT_PROJECTS` (default 4) bound discovery, while
 `METADATA_MAX_PENDING_PROJECTS` (default 16) bounds scheduled discovery work. Delayed jobs retain
@@ -62,7 +72,7 @@ bounds wheel extraction within those jobs, while `METADATA_RECOVERY_CONCURRENCY`
 reserves request-path capacity so advertised metadata can recover regardless of the background
 queue or idle delay. To keep large project indexes bounded, only the newest
 `METADATA_MAX_EXTRACT_FILES_PER_PROJECT` (default 32) parseable wheels missing metadata are
-probed during each project pass. Pending project responses use a one-second outer-cache TTL by
+probed during each project pass. Pending project responses use a 30-second outer-cache TTL by
 default to collapse concurrent bursts without hiding enrichment for the full project TTL; set
 `METADATA_PENDING_CACHE_TTL_SECONDS=0` to disable that microcache. Once the exact enriched
 response is complete, it becomes cacheable for its remaining project TTL. Generated metadata is retained for

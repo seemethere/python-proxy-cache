@@ -66,6 +66,35 @@ async def test_revalidate_304_with_etag(client, mock_upstream):
     assert rec.call_count == 2
 
 
+async def test_revalidate_preserves_acceptable_upstream_html(client, mock_upstream):
+    state = {"n": 0}
+
+    def handler(url, headers=None):
+        state["n"] += 1
+        if state["n"] == 1:
+            return Response(
+                200,
+                text=HTML,
+                headers={"content-type": "text/html", "etag": '"v1"'},
+            )
+        assert (headers or {}).get("If-None-Match") == '"v1"'
+        return Response(304, headers={"etag": '"v1"'})
+
+    rec = mock_upstream(handler)
+    accept = "application/vnd.pypi.simple.v1+json, text/html;q=0.01"
+    first = await client.get("/simple/demo/", headers={"Accept": accept})
+    assert first.headers["content-type"].startswith("text/html")
+    cache._mem.pop("simple:demo:html", None)
+
+    revalidated = await client.get("/simple/demo/", headers={"Accept": accept})
+
+    assert revalidated.headers["x-cache"] == "REVALIDATED"
+    assert revalidated.headers["content-type"].startswith("text/html")
+    assert revalidated.headers["x-synthesis"] == "0"
+    assert await cache.get("simple:demo:json") is None
+    assert rec.call_count == 2
+
+
 async def test_completed_metadata_stays_cacheable_after_304(client, mock_upstream, monkeypatch):
     monkeypatch.setattr(settings, "enable_background_metadata", True)
     enriched_html = HTML.replace(">a.whl</a>", ' data-core-metadata="true">a.whl</a>')
@@ -84,7 +113,9 @@ async def test_completed_metadata_stays_cacheable_after_304(client, mock_upstrea
 
     mock_upstream(handler)
     first = await client.get("/simple/demo/", headers={"Accept": "text/html"})
-    assert first.headers["cache-control"] == "public, max-age=1"
+    assert first.headers["cache-control"] == (
+        f"public, max-age={settings.metadata_pending_cache_ttl_seconds}"
+    )
     await drain_metadata_tasks()
 
     ready = await client.get("/simple/demo/", headers={"Accept": "text/html"})

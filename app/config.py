@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     # Comma-separated extra artifact hosts allowed for /artifacts/ rewrite (in addition to
     # the host from upstream_files_url).
     artifact_host_allowlist: str = ""
+    # Rewrite allowlisted file links through /artifacts/. Disabling this leaves
+    # ordinary downloads direct while still proxying links that advertise
+    # metadata, since generated `.metadata` is served by this application.
+    rewrite_artifact_urls: bool = True
     redis_url: str = "redis://redis:6379/0"
     cache_backend: CacheBackend = "redis"
     redis_startup_max_attempts: int = Field(default=30, ge=1)
@@ -30,13 +34,16 @@ class Settings(BaseSettings):
     enable_background_metadata: bool = False  # HEAD .metadata for 658/714 (off by default, lazy)
     # Briefly cache incomplete project pages to collapse concurrent resolver
     # bursts without hiding newly enriched metadata for the normal project TTL.
-    metadata_pending_cache_ttl_seconds: int = Field(default=1, ge=0)
+    metadata_pending_cache_ttl_seconds: int = Field(default=30, ge=0)
     # Global cap for complete per-file metadata probes, including cache operations
     # and upstream HEADs. Without it, one large project can exhaust either pool.
     metadata_head_concurrency: int = 10
     metadata_max_inflight_projects: int = 4
     # Hard bound on scheduled enrichment tasks (running plus queued).
     metadata_max_pending_projects: int = 16
+    # Wait for project traffic to become idle before native metadata discovery.
+    # HEAD probes are speculative and must not compete with an active resolver.
+    metadata_background_discovery_idle_seconds: float = Field(default=90.0, ge=0)
     # Wait for this much project-request inactivity observed by this process
     # before speculative wheel extraction. Zero restores immediate behavior.
     metadata_background_extraction_idle_seconds: float = Field(default=90.0, ge=0)
