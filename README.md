@@ -4,10 +4,12 @@ Pull-through cache for Python package indexes that synthesizes missing `PEP 691`
 
 Designed to sit behind your existing `nginx` fleet for thousands of CI runners.
 
-```
-runners -> nginx:8080 (cache) -> python-proxy:8000 (synthesis) -> PyPI / Nexus / Artifactory
-                    |-> /simple/*     5m cache, synthesis HTML<->JSON, rewrite file URLs
-                    `-> /artifacts/<host>/*  30d cache, slice, sendfile (allowlisted hosts)
+```mermaid
+flowchart LR
+    Runners --> Nginx["nginx:8080 (cache)"]
+    Nginx -- "/simple/*<br/>5m cache, synthesis HTML&lt;-&gt;JSON, rewrite file URLs" --> Proxy["python-proxy:8000 (synthesis)"]
+    Nginx -- "/artifacts/&lt;host&gt;/*<br/>30d cache, slice, sendfile (allowlisted hosts)" --> Proxy
+    Proxy --> Upstream["PyPI / Nexus / Artifactory"]
 ```
 
 ## Quick start
