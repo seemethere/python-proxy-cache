@@ -49,6 +49,54 @@ def test_rewrite_simple_json_body():
     assert data["files"][0]["url"].startswith("/artifacts/files.pythonhosted.org/")
 
 
+def test_disabled_rewrite_keeps_plain_json_urls_direct(monkeypatch):
+    monkeypatch.setattr(settings, "rewrite_artifact_urls", False)
+    body = json.dumps(
+        {
+            "files": [
+                {"url": "https://files.pythonhosted.org/packages/plain.whl"},
+                {
+                    "url": "https://files.pythonhosted.org/packages/metadata.whl",
+                    "core-metadata": True,
+                },
+            ]
+        }
+    )
+
+    files = json.loads(rewrite_simple_body(body, is_json=True))["files"]
+
+    assert files[0]["url"] == "https://files.pythonhosted.org/packages/plain.whl"
+    assert files[1]["url"] == "/artifacts/files.pythonhosted.org/packages/metadata.whl"
+
+
+def test_disabled_rewrite_plain_json_is_returned_verbatim(monkeypatch):
+    monkeypatch.setattr(settings, "rewrite_artifact_urls", False)
+    body = '{ "files": [{"url": "https://files.pythonhosted.org/plain.whl"}] }'
+
+    assert rewrite_simple_body(body, is_json=True) is body
+
+
+def test_disabled_rewrite_keeps_plain_html_urls_direct(monkeypatch):
+    monkeypatch.setattr(settings, "rewrite_artifact_urls", False)
+    body = (
+        '<a href="https://files.pythonhosted.org/packages/plain.whl">plain</a>'
+        '<a href="https://files.pythonhosted.org/packages/metadata.whl" '
+        'data-dist-info-metadata="false" data-core-metadata="true">metadata</a>'
+    )
+
+    rewritten = rewrite_simple_body(body, is_json=False)
+
+    assert 'href="https://files.pythonhosted.org/packages/plain.whl"' in rewritten
+    assert 'href="/artifacts/files.pythonhosted.org/packages/metadata.whl"' in rewritten
+
+
+def test_disabled_rewrite_plain_html_is_returned_verbatim(monkeypatch):
+    monkeypatch.setattr(settings, "rewrite_artifact_urls", False)
+    body = '<A HREF="https://files.pythonhosted.org/plain.whl">plain</A>'
+
+    assert rewrite_simple_body(body, is_json=False) is body
+
+
 def test_extra_allowlist(monkeypatch):
     monkeypatch.setattr(
         settings,
@@ -156,6 +204,45 @@ async def test_passthrough_json_keeps_pep700_708_740_fields(client, mock_upstrea
     assert data["files"][0]["provenance"] == "https://files.pythonhosted.org/a.whl.provenance"
     assert data["files"][0]["core-metadata"] == {"sha256": "deadbeef"}
     assert data["files"][0]["url"].startswith("/artifacts/files.pythonhosted.org/")
+
+
+async def test_disabled_rewrite_passthrough_json_leaves_plain_url_direct(
+    client, mock_upstream, monkeypatch
+):
+    monkeypatch.setattr(settings, "rewrite_artifact_urls", False)
+    body = json.loads(PEP_691_FULL)
+    body["files"][0].pop("core-metadata")
+    direct_url = body["files"][0]["url"]
+    mock_upstream(
+        lambda url, headers=None: Response(
+            200,
+            json=body,
+            headers={"content-type": "application/vnd.pypi.simple.v1+json"},
+        )
+    )
+
+    response = await client.get(
+        "/simple/demo/", headers={"Accept": "application/vnd.pypi.simple.v1+json"}
+    )
+
+    assert response.headers["x-synthesis"] == "0"
+    assert response.json()["files"][0]["url"] == direct_url
+
+
+async def test_disabled_rewrite_passthrough_html_leaves_plain_url_direct(
+    client, mock_upstream, monkeypatch
+):
+    monkeypatch.setattr(settings, "rewrite_artifact_urls", False)
+    direct_url = "https://files.pythonhosted.org/packages/plain.whl"
+    body = f'<html><body><a href="{direct_url}">plain.whl</a></body></html>'
+    mock_upstream(
+        lambda url, headers=None: Response(200, text=body, headers={"content-type": "text/html"})
+    )
+
+    response = await client.get("/simple/demo/", headers={"Accept": "text/html"})
+
+    assert response.headers["x-synthesis"] == "0"
+    assert direct_url in response.text
 
 
 def test_rewrite_preserves_non_default_port(monkeypatch):

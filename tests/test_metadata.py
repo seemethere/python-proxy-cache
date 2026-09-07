@@ -171,7 +171,9 @@ async def test_metadata_probe_on_enriches_cache(client, mock_upstream, monkeypat
     assert r.status_code == 200
     # Hot path still advertises false until enrichment finishes
     assert r.json()["files"][0].get("core-metadata") is False
-    assert r.headers["cache-control"] == "public, max-age=1"
+    assert r.headers["cache-control"] == (
+        f"public, max-age={settings.metadata_pending_cache_ttl_seconds}"
+    )
     assert "accept" in r.headers["vary"].lower()
 
     await head_started.wait()
@@ -180,7 +182,9 @@ async def test_metadata_probe_on_enriches_cache(client, mock_upstream, monkeypat
     )
     assert pending.headers["x-cache"] == "HIT"
     assert pending.json()["files"][0]["core-metadata"] is False
-    assert pending.headers["cache-control"] == "public, max-age=1"
+    assert pending.headers["cache-control"] == (
+        f"public, max-age={settings.metadata_pending_cache_ttl_seconds}"
+    )
     assert "accept" in pending.headers["vary"].lower()
 
     release_head.set()
@@ -203,7 +207,9 @@ async def test_metadata_probe_on_enriches_cache(client, mock_upstream, monkeypat
     assert "accept" in cached_json.headers["vary"].lower()
 
     pending_html = await client.get("/simple/metaon/", headers={"Accept": "text/html"})
-    assert pending_html.headers["cache-control"] == "public, max-age=1"
+    assert pending_html.headers["cache-control"] == (
+        f"public, max-age={settings.metadata_pending_cache_ttl_seconds}"
+    )
     await drain_metadata_tasks()
     cached_html = await client.get("/simple/metaon/", headers={"Accept": "text/html"})
     assert 'data-core-metadata="true"' in cached_html.text
@@ -226,7 +232,9 @@ async def test_completed_noop_enrichment_makes_exact_body_cacheable(
     )
 
     first = await client.get("/simple/native/", headers={"Accept": "text/html"})
-    assert first.headers["cache-control"] == "public, max-age=1"
+    assert first.headers["cache-control"] == (
+        f"public, max-age={settings.metadata_pending_cache_ttl_seconds}"
+    )
     await drain_metadata_tasks()
 
     second = await client.get("/simple/native/", headers={"Accept": "text/html"})
@@ -337,6 +345,38 @@ async def test_enrichment_does_not_clobber_a_newer_body(client, mock_upstream, m
         await metadata_response_cache_ttl("racy", "<html><body>NEW</body></html>", is_json=False)
         is None
     )
+
+
+async def test_delayed_discovery_enriches_stale_body_without_reviving_current(
+    client, mock_upstream, monkeypatch
+):
+    """An idle delay may exceed the current TTL without discarding useful work."""
+    import app.metadata as meta
+
+    monkeypatch.setattr(settings, "enable_background_metadata", True)
+    monkeypatch.setattr(settings, "rewrite_artifact_urls", False)
+    body = (
+        "<!DOCTYPE html><html><body>"
+        '<a href="https://files.pythonhosted.org/packages/'
+        f'demo-1.0-py3-none-any.whl#sha256={"a" * 64}">demo-1.0-py3-none-any.whl</a>'
+        "</body></html>"
+    )
+    mock_upstream(
+        lambda url, headers=None: Response(500),
+        head_handler=lambda url, headers=None: Response(200),
+    )
+    await cache.setex("simple:delayed:html:stale", 60, body)
+    completions_before = metrics["metadata_discovery_completions"]
+
+    await meta._enrich("delayed", body, is_json=False, ttl=1)
+
+    enriched = await cache.get("simple:delayed:html:stale")
+    assert enriched is not None
+    assert 'data-core-metadata="true"' in enriched
+    assert await cache.get("simple:delayed:html") is None
+    assert metrics["metadata_discovery_completions"] == completions_before + 1
+    assert await cache.get("simple:delayed:html:metadata-discovered") == meta._body_digest(enriched)
+    assert await cache.get("simple:delayed:html:metadata-ready") == meta._body_digest(enriched)
 
 
 async def test_invalid_or_wrong_readiness_marker_is_not_cacheable():
@@ -775,6 +815,7 @@ async def test_failed_head_extracts_and_advertises_hashed_metadata(
     import app.metadata as meta
 
     monkeypatch.setattr(settings, "enable_background_metadata", True)
+    monkeypatch.setattr(settings, "rewrite_artifact_urls", False)
     monkeypatch.setattr(settings, "metadata_artifact_base_url", "http://nginx:8080")
     wheel_sha256 = "b" * 64
     content = b"Metadata-Version: 2.4\nName: demo\nVersion: 1.0\n"
@@ -815,15 +856,15 @@ async def test_failed_head_extracts_and_advertises_hashed_metadata(
     )
     assert response.status_code == 200
     assert "core-metadata" not in response.json()["files"][0]
+    assert response.json()["files"][0]["url"].startswith("https://")
     await drain_metadata_tasks()
 
-    assert extracted_urls == [
-        "http://nginx:8080/artifacts/files.pythonhosted.org/packages/demo.whl"
-    ]
+    assert extracted_urls == ["https://files.pythonhosted.org/packages/demo.whl"]
     body = await cache.get("simple:demo:json")
     assert body is not None
     enriched = json.loads(body)
     assert enriched["files"][0]["core-metadata"] == {"sha256": metadata_sha256}
+    assert enriched["files"][0]["url"] == ("/artifacts/files.pythonhosted.org/packages/demo.whl")
     # Enrichment mutates only the advertisement and retains fields unknown to our model.
     assert enriched["versions"] == ["1.0"]
     assert enriched["meta"]["tracks"] == ["https://example.test/simple/demo/"]
@@ -888,6 +929,7 @@ async def test_native_discovery_finishes_before_delayed_extraction(
 
     await drain_metadata_tasks()
     monkeypatch.setattr(settings, "enable_background_metadata", True)
+    monkeypatch.setattr(settings, "rewrite_artifact_urls", False)
     extraction_release = asyncio.Event()
     extraction_waiting = asyncio.Event()
     extracted: list[str] = []
@@ -915,16 +957,24 @@ async def test_native_discovery_finishes_before_delayed_extraction(
 
     response = await client.get("/simple/phased/", headers={"Accept": "text/html"})
     assert response.status_code == 200
+    assert "https://files.pythonhosted.org/packages/demo-1.0" in response.text
     await asyncio.wait_for(extraction_waiting.wait(), 1)
 
     assert extracted == []
     assert len(_extraction_pending) == 1
     assert len([call for call in recorder.calls if call["method"] == "HEAD"]) == 1
     assert await meta.metadata_response_cache_ttl("phased", html, is_json=False) is None
+    body_ttl = await cache.ttl("simple:phased:html")
+    discovered_ttl = await cache.ttl("simple:phased:html:metadata-discovered")
+    assert body_ttl is not None
+    assert discovered_ttl is not None
+    assert discovered_ttl > body_ttl
 
     # The exact discovery marker avoids repeating HEAD while extraction waits.
     await client.get("/simple/phased/", headers={"Accept": "text/html"})
     await asyncio.sleep(0)
+    assert _pending == {}
+    assert len(_extraction_pending) == 1
     assert len([call for call in recorder.calls if call["method"] == "HEAD"]) == 1
 
     extraction_release.set()
@@ -934,6 +984,7 @@ async def test_native_discovery_finishes_before_delayed_extraction(
     assert len([call for call in recorder.calls if call["method"] == "HEAD"]) == 1
     enriched = await client.get("/simple/phased/", headers={"Accept": "text/html"})
     assert 'data-core-metadata="sha256=' in enriched.text
+    assert 'href="/artifacts/files.pythonhosted.org/packages/demo-1.0' in enriched.text
     assert enriched.headers["cache-control"].startswith("public, max-age=")
 
 
@@ -1061,6 +1112,53 @@ async def test_extraction_idle_wait_uses_configured_project_quiet_period(monkeyp
     assert sleeps == [2.0]
 
 
+async def test_discovery_idle_wait_uses_configured_project_quiet_period(monkeypatch):
+    import app.metadata as meta
+
+    class FakeLoop:
+        def __init__(self):
+            self.times = iter((10.0, 13.0))
+
+        def time(self) -> float:
+            return next(self.times)
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(settings, "metadata_background_discovery_idle_seconds", 3.0)
+    monkeypatch.setattr(meta, "_last_project_activity", 10.0)
+    monkeypatch.setattr(meta.asyncio, "get_running_loop", lambda: FakeLoop())
+    monkeypatch.setattr(meta.asyncio, "sleep", fake_sleep)
+
+    await meta._wait_for_discovery_idle()
+
+    assert sleeps == [3.0]
+
+
+async def test_discovery_rechecks_idle_after_worker_admission(monkeypatch):
+    import app.metadata as meta
+
+    idle_checks = 0
+
+    async def record_idle_check() -> None:
+        nonlocal idle_checks
+        idle_checks += 1
+
+    def parse(*args, **kwargs):
+        raise AssertionError("parse should be replaced through to_thread")
+
+    monkeypatch.setattr(meta, "_wait_for_discovery_idle", record_idle_check)
+    monkeypatch.setattr(meta, "_parse_project_body", parse)
+
+    # The replacement raises after both idle checks; _enrich contains the
+    # background failure, as it does in production.
+    await meta._enrich("idle-check", "<html></html>", is_json=False, ttl=60)
+
+    assert idle_checks == 2
+
+
 async def test_delayed_extraction_rechecks_idle_between_batches(monkeypatch):
     import app.metadata as meta
 
@@ -1124,6 +1222,33 @@ async def test_ready_hits_and_404s_record_project_activity(client, mock_upstream
     assert meta._last_project_activity > 0
 
 
+async def test_discovered_cached_body_resumes_extraction_without_discovery(monkeypatch):
+    import app.metadata as meta
+
+    await drain_metadata_tasks()
+    monkeypatch.setattr(settings, "enable_background_metadata", True)
+    body = "<!DOCTYPE html><html><body></body></html>"
+    await cache.setex(
+        meta._project_discovered_key("example-pkg", is_json=False),
+        60,
+        meta._body_digest(body),
+    )
+    scheduled: list[tuple[str, bool, str]] = []
+
+    def schedule_extraction(canonical: str, *, is_json: bool, body: str) -> None:
+        scheduled.append((canonical, is_json, body))
+
+    def unexpected_discovery(*args, **kwargs) -> None:
+        raise AssertionError("exact discovered body should not restart discovery")
+
+    monkeypatch.setattr(meta, "_schedule_project_extraction", schedule_extraction)
+    monkeypatch.setattr(meta, "schedule_metadata_enrichment", unexpected_discovery)
+
+    await meta.ensure_metadata_background_work("Example_Pkg", body, is_json=False)
+
+    assert scheduled == [("example-pkg", False, body)]
+
+
 async def test_enrichment_schedule_has_hard_pending_bound(monkeypatch):
     import asyncio
 
@@ -1148,6 +1273,38 @@ async def test_enrichment_schedule_has_hard_pending_bound(monkeypatch):
     assert metrics["metadata_enrichment_dropped"] == dropped_before + 1
     release.set()
     await drain_metadata_tasks()
+
+
+def test_queue_drop_logs_are_exponentially_rate_limited(caplog):
+    import app.metadata as meta
+
+    enrichment_before = metrics["metadata_enrichment_dropped"]
+    extraction_before = metrics["metadata_extraction_jobs_dropped"]
+    metrics["metadata_enrichment_dropped"] = 0
+    metrics["metadata_extraction_jobs_dropped"] = 0
+    try:
+        with caplog.at_level("WARNING"):
+            for _ in range(9):
+                meta._log_queue_drop("metadata_enrichment_dropped", "enrichment")
+            for _ in range(5):
+                meta._log_queue_drop("metadata_extraction_jobs_dropped", "extraction")
+
+        enrichment = [record.message for record in caplog.records if "enrichment" in record.message]
+        extraction = [record.message for record in caplog.records if "extraction" in record.message]
+        assert enrichment == [
+            "metadata enrichment queue full; 1 total drops",
+            "metadata enrichment queue full; 2 total drops",
+            "metadata enrichment queue full; 4 total drops",
+            "metadata enrichment queue full; 8 total drops",
+        ]
+        assert extraction == [
+            "metadata extraction queue full; 1 total drops",
+            "metadata extraction queue full; 2 total drops",
+            "metadata extraction queue full; 4 total drops",
+        ]
+    finally:
+        metrics["metadata_enrichment_dropped"] = enrichment_before
+        metrics["metadata_extraction_jobs_dropped"] = extraction_before
 
 
 async def test_enrichment_schedule_coalesces_canonical_project(monkeypatch):
