@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+
+import pytest
 from httpx import Response
 
 from app.cache import cache
@@ -612,26 +615,145 @@ async def test_metadata_route_recovers_after_cache_local_miss(client, mock_upstr
     assert extracted == ["https://files.pythonhosted.org/packages/demo.whl?signature=renewed"]
 
 
-async def test_metadata_route_preserves_native_sidecar_fallback(client, mock_upstream, monkeypatch):
+@pytest.mark.parametrize(
+    "sidecar",
+    [
+        "valid",
+        "missing",
+        "redirect",
+        "invalid_utf8",
+        "large_header",
+        "large_body",
+        "html",
+        "wrong_name",
+        "wrong_version",
+        "duplicate_name",
+        "missing_version",
+        "invalid_version",
+        "invalid_metadata_version",
+        "encoded",
+    ],
+)
+async def test_metadata_route_reads_native_sidecar_before_serving(client, monkeypatch, sidecar):
+    import gzip
+
+    import httpx
+
+    import app.metadata as meta
+    from app.wheel_metadata import MAX_METADATA_SIZE
+
+    monkeypatch.setattr(settings, "enable_background_metadata", True)
+    content = b"Metadata-Version: 2.4\nName: demo\nVersion: 1.0\n"
+    calls = []
+    consumed = []
+    closed = []
+
+    class EncodedStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            consumed.append(True)
+            yield gzip.compress(content)
+
+        async def aclose(self):
+            closed.append(True)
+
+    def upstream(request):
+        calls.append((request.method, str(request.url)))
+        # A HEAD and the following GET can reach different cache replicas.
+        if request.method == "HEAD":
+            return Response(200)
+        if sidecar == "missing":
+            return Response(400, text="invalid extension type")
+        if sidecar == "redirect":
+            return Response(302, headers={"Location": "https://untrusted.example/metadata"})
+        if sidecar == "invalid_utf8":
+            return Response(200, content=b"\xff")
+        if sidecar == "large_header":
+            return Response(200, headers={"Content-Length": str(MAX_METADATA_SIZE + 1)})
+        if sidecar == "large_body":
+            return Response(200, content=b"x" * (MAX_METADATA_SIZE + 1))
+        if sidecar == "html":
+            return Response(200, text="<html>temporarily unavailable</html>")
+        if sidecar == "wrong_name":
+            return Response(200, content=content.replace(b"Name: demo", b"Name: other"))
+        if sidecar == "wrong_version":
+            return Response(200, content=content.replace(b"Version: 1.0", b"Version: 2.0"))
+        if sidecar == "duplicate_name":
+            return Response(200, content=content + b"Name: demo\n")
+        if sidecar == "missing_version":
+            return Response(200, content=content.replace(b"Version: 1.0\n", b""))
+        if sidecar == "invalid_version":
+            return Response(
+                200, content=content.replace(b"Version: 1.0", b"Version: not-a-version")
+            )
+        if sidecar == "invalid_metadata_version":
+            return Response(
+                200, content=content.replace(b"Metadata-Version: 2.4", b"Metadata-Version: no")
+            )
+        if sidecar == "encoded":
+            return Response(200, headers={"Content-Encoding": "gzip"}, stream=EncodedStream())
+        return Response(200, content=content)
+
+    extractions = []
+
+    async def extract(url):
+        extractions.append(url)
+        return content
+
+    monkeypatch.setattr(meta, "_extract_wheel_metadata", extract)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as http_client:
+        monkeypatch.setattr(meta, "get_http_client", lambda: http_client)
+        artifact_url = "https://files.pythonhosted.org/packages/demo-1.0-py3-none-any.whl"
+        url = "/artifacts/files.pythonhosted.org/packages/demo-1.0-py3-none-any.whl.metadata"
+        response = await client.get(url)
+        assert response.status_code == 200
+        assert response.content == content
+        assert response.headers["etag"] == f'"sha256:{hashlib.sha256(content).hexdigest()}"'
+        expected_url = artifact_url + ".metadata"
+        assert calls == [("HEAD", expected_url), ("GET", expected_url)]
+        assert extractions == ([] if sidecar == "valid" else [artifact_url])
+        if sidecar == "encoded":
+            # Reject the encoding before HTTPX can decompress an unbounded body.
+            assert consumed == []
+            assert closed == [True]
+        # The body being served is stored locally; no later backend request is needed.
+        assert (await client.get(url)).content == content
+        assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("filename", "name", "version"),
+    [
+        ("demo_pkg-1.0-py3-none-any.whl", "Demo.Pkg", "1.0.0"),
+        ("demo_pkg-1.0%2Bbuild.1-py3-none-any.whl", "demo-pkg", "1.0+BUILD.1"),
+    ],
+)
+async def test_native_metadata_uses_package_identity_semantics(
+    client, monkeypatch, filename, name, version
+):
+    import httpx
+
     import app.metadata as meta
 
     monkeypatch.setattr(settings, "enable_background_metadata", True)
-    recorder = mock_upstream(
-        lambda url, headers=None: Response(200),
-        head_handler=lambda url, headers=None: Response(200),
-    )
+    content = (
+        f"Metadata-Version: 2.4\nName: {name}\nVersion: {version}\n"
+        "X-Extension: preserved\n\nUnicode description: caf\u00e9\n"
+    ).encode()
 
-    async def unexpected_extract(url: str) -> bytes:
-        raise AssertionError(f"native metadata must not extract {url}")
+    def upstream(request):
+        return Response(200, content=content if request.method == "GET" else b"")
+
+    async def unexpected_extract(url):
+        raise AssertionError(f"valid native metadata must not extract {url}")
 
     monkeypatch.setattr(meta, "_extract_wheel_metadata", unexpected_extract)
-    response = await client.get("/artifacts/files.pythonhosted.org/packages/native.whl.metadata")
-
-    # nginx interprets this internal 404 as its signal to fetch the canonical
-    # native sidecar from the artifact upstream.
-    assert response.status_code == 404
-    assert recorder.calls[0]["method"] == "HEAD"
-    assert recorder.calls[0]["kwargs"] == {"follow_redirects": False}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as http_client:
+        monkeypatch.setattr(meta, "get_http_client", lambda: http_client)
+        response = await client.get(
+            f"/artifacts/files.pythonhosted.org/packages/{filename}.metadata"
+        )
+        assert response.status_code == 200
+        assert response.content == content
 
 
 async def test_metadata_route_recovery_is_singleflight(client, mock_upstream, monkeypatch):
@@ -1415,3 +1537,72 @@ async def test_large_project_only_probes_bounded_candidates_and_publishes(
     assert files_by_name["demo-1001.0-py3-none-any.whl"]["core-metadata"] == {
         "sha256": upstream_metadata_hash
     }
+
+
+@pytest.mark.parametrize("cache_state", ["cold_replica", "missing_content"])
+async def test_recovery_uses_wheel_when_native_head_and_get_disagree(
+    client, monkeypatch, cache_state
+):
+    import io
+    import zipfile
+
+    import httpx
+
+    import app.metadata as meta
+    from app.cache import Cache
+
+    monkeypatch.setattr(settings, "enable_background_metadata", True)
+    content = b"Metadata-Version: 2.4\nName: puremagic\nVersion: 1.27\n"
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as wheel:
+        wheel.writestr("puremagic-1.27.dist-info/METADATA", content)
+    wheel_body = output.getvalue()
+    artifact = "https://files.pythonhosted.org/packages/puremagic-1.27-py3-none-any.whl"
+    url = "/artifacts/files.pythonhosted.org/packages/puremagic-1.27-py3-none-any.whl.metadata"
+
+    file_url = url.removesuffix(".metadata")
+
+    # Each deployed frontend has its own cache. Seed a warm replica through the
+    # production storage API, then serve the request from a cold/partial cache.
+    warm = Cache(backend="memory")
+    cold = Cache(backend="memory")
+    monkeypatch.setattr(meta, "cache", warm)
+    await meta.store_recovered_metadata(file_url, content)
+    record_key = meta._metadata_url_key(file_url)
+    record = await warm.get(record_key)
+    assert record is not None
+    if cache_state == "missing_content":
+        await cold.setex(record_key, settings.metadata_cache_ttl_seconds, record)
+    monkeypatch.setattr(meta, "cache", cold)
+    assert await meta.load_metadata_for_url(file_url) is None
+
+    calls = []
+
+    def origin(request):
+        calls.append((request.method, str(request.url)))
+        if request.method == "HEAD":
+            return Response(200)  # Cached HEAD on the first backend replica.
+        if str(request.url).endswith(".metadata"):
+            return Response(400, text="invalid extension type for file")
+        assert str(request.url) == artifact
+        assert request.headers["Accept-Encoding"] == "identity"
+        assert request.headers["Range"].startswith("bytes=-")
+        # Exercise the real bounded ZIP extractor on a small wheel; no metadata
+        # loader, extractor or cache method is mocked.
+        return Response(200, content=wheel_body)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(origin)) as upstream:
+        monkeypatch.setattr(meta, "get_http_client", lambda: upstream)
+        response = await client.get(url)
+        assert response.status_code == 200
+        assert response.content == content
+        digest = hashlib.sha256(content).hexdigest()
+        assert response.headers["etag"] == f'"sha256:{digest}"'
+        assert calls == [
+            ("HEAD", artifact + ".metadata"),
+            ("GET", artifact + ".metadata"),
+            ("GET", artifact),
+        ]
+        assert await meta.load_metadata_for_url(file_url) == (content.decode(), digest)
+        assert (await client.get(url)).content == content
+        assert len(calls) == 3

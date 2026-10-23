@@ -6,9 +6,10 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from urllib.parse import urlparse, urlsplit, urlunsplit
+from urllib.parse import unquote, urlparse, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
+from packaging.metadata import Metadata
 from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel_filename
 from packaging.version import Version
 
@@ -316,6 +317,44 @@ async def _extract_wheel_metadata(url: str) -> bytes:
     return await extract_wheel_metadata(get_http_client(), url)
 
 
+async def _fetch_native_metadata(url: str) -> bytes | None:
+    """Read a native sidecar with the same body bound as wheel extraction."""
+    from app.wheel_metadata import MAX_METADATA_SIZE
+
+    filename = unquote(urlsplit(url).path.rsplit("/", 1)[-1]).removesuffix(".metadata")
+    wheel_name, wheel_version, _, _ = parse_wheel_filename(filename)
+    async with get_http_client().stream(
+        "GET", url, headers={"Accept-Encoding": "identity"}, follow_redirects=False
+    ) as response:
+        if response.status_code != 200:
+            return None
+        if response.headers.get("Content-Encoding", "identity").lower() not in ("", "identity"):
+            return None
+        content_length = response.headers.get("Content-Length")
+        if content_length is not None and not 0 < int(content_length) <= MAX_METADATA_SIZE:
+            return None
+        chunks: list[bytes] = []
+        received = 0
+        async for chunk in response.aiter_bytes(chunk_size=MAX_METADATA_SIZE + 1):
+            received += len(chunk)
+            if received > MAX_METADATA_SIZE:
+                return None
+            chunks.append(chunk)
+        if not received or (content_length is not None and received != int(content_length)):
+            return None
+        content = b"".join(chunks)
+        # Validate the required identity fields before persisting an origin body.
+        # Leave optional/extension fields untouched and preserve the original bytes.
+        metadata = Metadata.from_email(content.decode("utf-8"), validate=False)
+        if (
+            not metadata.metadata_version
+            or canonicalize_name(metadata.name) != wheel_name
+            or metadata.version != wheel_version
+        ):
+            return None
+        return content
+
+
 async def _resolve_metadata_for_url(
     file_url: str,
     *,
@@ -364,9 +403,25 @@ async def _resolve_metadata_for_url(
                     response = None
             metrics["metadata_heads"] += 1
             if response is not None and response.status_code == 200:
-                if recovery:
-                    metrics["metadata_recovery_native_fallbacks"] += 1
-                return _MetadataResolution(native=True)
+                if not recovery:
+                    return _MetadataResolution(native=True)
+                # HEAD and a later nginx GET can reach different backend replicas.
+                # Serve the body we read, or recover from the wheel if it is unavailable.
+                try:
+                    async with _recovery_extract_semaphore:
+                        content = await asyncio.wait_for(
+                            _fetch_native_metadata(native_url), timeout=_HEAD_TIMEOUT
+                        )
+                    if content is not None:
+                        body, metadata_sha256 = await store_recovered_metadata(file_url, content)
+                        metrics["metadata_recovery_native_fallbacks"] += 1
+                        return _MetadataResolution(body=body, metadata_sha256=metadata_sha256)
+                except Exception:
+                    logger.debug(
+                        "native metadata read failed for %s",
+                        _safe_url_for_log(native_url),
+                        exc_info=True,
+                    )
         if not allow_extraction:
             return None
 
